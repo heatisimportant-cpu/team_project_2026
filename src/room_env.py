@@ -17,9 +17,6 @@ Action (1 dim)
   Normalized supply temperature in [-1, 1]
   mapped to [T_HP_MIN, T_HP_MAX] = [20, 65] °C
 
-Reward
-------
-  r = − price(k) × E_el_kWh  − comfort_weight × dev_neg_max
 """
 
 import numpy as np
@@ -193,7 +190,7 @@ class RoomHeatEnv(gym.Env):
         self.state       = self._build_obs(next_state)
 
         E_el_kWh  = costs['E_el'] / 1000.0
-        hp_is_on  = costs['P_el'] > 0.0
+        hp_is_on  = costs['hp_on']   # from simulator's modulation-floor logic
         cycle     = (hp_is_on != self._hp_was_on)   # state changed → cycle event
         self._hp_was_on = hp_is_on
         costs['T_room_last'] = next_state['T_room']  # pass T_room to reward fn
@@ -215,6 +212,7 @@ class RoomHeatEnv(gym.Env):
             'T_room':      float(next_state['T_room']),
             'T_amb':       float(pk['T_amb']),
             'u':           float(T_hp_sup),
+            'hp_on':       bool(hp_is_on),
             't':           int(self.t),
         }
 
@@ -266,7 +264,7 @@ class RoomHeatEnv(gym.Env):
             +1.0          if T_room in [20, 22]°C  (flat reward in comfort band)
             -(T_room-21)² otherwise                (parabola, peak at 21°C)
 
-        electricity_cost = price [€/kWh] × E_el_kWh
+        electricity_cost = price [€/kWh] * E_el_kWh
 
         cycle_penalty = cycle_weight  if HP switched on↔off this step
         """

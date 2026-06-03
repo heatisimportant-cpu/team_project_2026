@@ -36,8 +36,8 @@ def get_args():
                    help='Number of days to evaluate.')
     p.add_argument('--save',     type=str, default=None,
                    help='Path to save the plot (e.g. eval.png). Shows interactively if not set.')
-    p.add_argument('--T_comfort_low',  type=float, default=19.0)
-    p.add_argument('--T_comfort_high', type=float, default=23.0)
+    p.add_argument('--T_comfort_low',  type=float, default=20.0)
+    p.add_argument('--T_comfort_high', type=float, default=22.0)
     return p.parse_args()
 
 
@@ -77,6 +77,7 @@ def run_episode(model, env):
             'T_room':    info['T_room'],
             'T_amb':     info['T_amb'],
             'u':         info['u'],              # T_hp_sup actually applied
+            'hp_on':     info['hp_on'],          # compressor on/off (modulation floor)
             'price':     info['price'],
             'E_el_kWh':  info['E_el_kWh'],
             'dev_neg':   info['dev_neg_max'],
@@ -146,7 +147,7 @@ def plot_results(df, T_low, T_high, save_path=None):
     total_cost   = (df['price'] * df['E_el_kWh']).sum()
     total_energy = df['E_el_kWh'].sum()
     pct_comfort  = 100 * (1 - (df['T_room'] < T_low).mean())
-    n_cycles     = int(((df['u'] > 20).astype(int).diff().abs() > 0).sum() / 2)
+    n_cycles     = int((df['hp_on'].astype(int).diff().abs() > 0).sum() / 2)
 
     stats = (f"Energy: {total_energy:.1f} kWh  |  "
              f"Cost: €{total_cost:.2f}  |  "

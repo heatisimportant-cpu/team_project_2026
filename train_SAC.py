@@ -11,9 +11,9 @@ SAC is preferred over PPO here because:
 
 Usage
 -----
-    python src/train.py                              # synthetic data
-    python src/train.py --data data/train.csv        # real training data
-    python src/train.py --data data/train.csv \\
+    python train_SAC.py                              # synthetic data
+    python train_SAC.py --data data/train.csv        # real training data
+    python train_SAC.py --data data/train.csv \\
                         --eval_data data/test.csv \\
                         --timesteps 500000
 

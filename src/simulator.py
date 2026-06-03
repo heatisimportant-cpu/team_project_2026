@@ -114,14 +114,26 @@ class Simulator:
         ))
         Qdot_th = max(Qdot_th, 0.0)   # can't be negative
 
-        P_el = Qdot_th / COP if COP > 0 else 0.0   # W
-        E_el = P_el * self.timestep / 3600.0         # Wh
+        # ── Modulation floor (datasheet: ALM 4-12 min stable output ~4 kW) ────
+        # The inverter compressor cannot sustain output between 0 and 4 kW.
+        # It either runs at >= 4 kW or shuts off entirely.
+        Q_MOD_MIN = 4000.0   # W — minimum stable thermal output
+        if Qdot_th >= Q_MOD_MIN / 2.0:
+            Qdot_th = max(Qdot_th, Q_MOD_MIN)   # run at least at the floor
+            hp_on   = True
+        else:
+            Qdot_th = 0.0                         # below half-floor -> off
+            hp_on   = False
+
+        P_el = Qdot_th / COP if (COP > 0 and hp_on) else 0.0   # W
+        E_el = P_el * self.timestep / 3600.0                    # Wh
 
         cost_hp = {
             'COP':     float(COP),
             'Qdot_th': float(Qdot_th),   # W
             'P_el':    float(P_el),       # W
             'E_el':    float(E_el),       # Wh
+            'hp_on':   bool(hp_on),       # True if compressor is running
         }
 
         # ── Comfort deviation ─────────────────────────────────────────────────
