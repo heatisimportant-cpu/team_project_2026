@@ -25,9 +25,10 @@ import gymnasium as gym
 from gymnasium import spaces
 from typing import Dict, Optional
 
-from models.vonovia_model import Building, vonovia_model
-from models.heatpump_model import iDM_AERO_ALM_4_12
+from models.vonovia_model import Building, BUILDING_MODELS
+from models.heatpump_model import HEATPUMP_MODELS
 from src.simulator import Simulator
+from src.disturbances import get_internal_gains
 
 # ── Observation space bounds ──────────────────────────────────────────────────
 OBS_LIMITS = {
@@ -85,6 +86,7 @@ class RoomHeatEnv(gym.Env):
         noise_level: float = 0.0,
         T_room_set_lower: float = 20.0,
         T_room_set_upper: float = 26.0,
+        internal_gain_profile: str = 'data/internalGains.csv',
     ):
         super().__init__()
 
@@ -95,6 +97,16 @@ class RoomHeatEnv(gym.Env):
         self.cycle_weight   = cycle_weight
         self.noise_level    = noise_level
 
+        self.mdot_HP = mdot_HP
+        self.T_room_set_lower = T_room_set_lower
+        self.T_room_set_upper = T_room_set_upper
+
+        self.building_models = BUILDING_MODELS
+        self.current_building_params = None
+
+        self.heatpump_models = HEATPUMP_MODELS
+        self.current_heatpump_class = None
+
         # ── Disturbance profile ───────────────────────────────────────────────
         self.p = disturbances[['T_amb', 'price_eur_kwh']].copy()
         self.p['Qdot_gains'] = (
@@ -104,19 +116,18 @@ class RoomHeatEnv(gym.Env):
         )
         self.p = self.p.resample(f'{delta_t}s').ffill().astype(np.float32)
 
+        # ── Internal gains per m² (DIN EN 16798-1, scaled by building area later) ──
+        # Computed once for 1 m²; multiplied by the selected building's area each step.
+        try:
+            self._int_gains_per_m2 = get_internal_gains(
+                time=self.p.index, profile_path=internal_gain_profile, bldg_area=1.0
+            ).astype(np.float32)
+        except Exception as exc:
+            print(f"[RoomHeatEnv] Internal gains profile not loaded ({exc}); using 0.")
+            self._int_gains_per_m2 = pd.Series(0.0, index=self.p.index, dtype=np.float32)
+
         # ── Models & simulator ────────────────────────────────────────────────
-        self.bldg_model = Building(
-            params=vonovia_model,
-            mdot_hp=mdot_HP,
-            T_room_set_lower=T_room_set_lower,
-            T_room_set_upper=T_room_set_upper,
-        )
-        self.hp_model  = iDM_AERO_ALM_4_12()
-        self.simulator = Simulator(
-            hp_model=self.hp_model,
-            bldg_model=self.bldg_model,
-            timestep=delta_t,
-        )
+        self._select_models()
 
         # ── Episode length ────────────────────────────────────────────────────
         if days is not None:
@@ -140,9 +151,36 @@ class RoomHeatEnv(gym.Env):
         self.prev_action = None
         self._hp_was_on  = False   # tracks HP on/off state for cycle detection
         self.reset()
+    
+    def _select_models(self):
+        """Randomly select one building model and one heat pump model."""
+        # Select building
+        bldg_idx = int(self.np_random.integers(0, len(self.building_models)))
+        self.current_building_params = self.building_models[bldg_idx]
+
+        self.bldg_model = Building(
+            params=self.current_building_params,
+            mdot_hp=self.current_building_params.get('mdot_hp', self.mdot_HP),
+            T_room_set_lower=self.T_room_set_lower,
+            T_room_set_upper=self.T_room_set_upper,
+        )
+
+        # Select heat pump class and instantiate it
+        hp_idx = int(self.np_random.integers(0, len(self.heatpump_models)))
+        self.current_heatpump_class = self.heatpump_models[hp_idx]
+        self.hp_model = self.current_heatpump_class()
+
+        # Recreate simulator with the selected building + heat pump
+        self.simulator = Simulator(
+            hp_model=self.hp_model,
+            bldg_model=self.bldg_model,
+            timestep=self.delta_t,
+        )
 
     def reset(self, seed=None, **kwargs):
         super().reset(seed=seed)
+
+        self._select_models()
 
         if self.random_init:
             max_start = len(self.p) - self.max_steps - self.forecast_steps - 1
@@ -286,7 +324,12 @@ class RoomHeatEnv(gym.Env):
         return scale*float(self.comfort_weight * comfort - cost_penalty - cycle_penalty)
 
     def _get_pk(self, t: int) -> Dict:
-        return self.p.iloc[min(t, len(self.p) - 1)].to_dict()
+        idx = min(t, len(self.p) - 1)
+        pk = self.p.iloc[idx].to_dict()
+        # Add internal gains scaled by the selected building's floor area
+        area = self.bldg_model.params['area_floor']
+        pk['Qdot_gains'] = pk['Qdot_gains'] + float(self._int_gains_per_m2.iloc[idx]) * area
+        return pk
 
     def _denorm_action(self, a: float) -> float:
         return float(a * (T_HP_MAX - T_HP_MIN) / 2.0 + (T_HP_MIN + T_HP_MAX) / 2.0)

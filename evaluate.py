@@ -185,7 +185,7 @@ def main():
     env = RoomHeatEnv(
         disturbances=data,
         days=args.days,
-        random_init=False,
+        random_init=True,
         forecast_steps=24,
     )
 

@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 """
 Split the clean dataset into train (2021-2023) and test (2024+).
 Run once: python split_data.py
