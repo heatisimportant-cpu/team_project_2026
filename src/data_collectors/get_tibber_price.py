@@ -16,4 +16,4 @@ df = pd.DataFrame({
 df["tibber_kwh"] = ((df["price_eur_mwh"] / 10) * 1.19) + 17.17
 
 print(df.head())
-df.to_csv("../data/tibber_price.csv")
+df.to_csv("data/tibber_price.csv",index=False)
