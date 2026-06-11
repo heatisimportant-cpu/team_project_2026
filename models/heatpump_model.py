@@ -186,6 +186,9 @@ class iDM_AERO_ALM_4_12:
             (20, 35): 5.42,
         }
 
+HEATPUMP_MODELS = [
+    iDM_AERO_ALM_4_12,
+]
 
 # ── Quick self-test ───────────────────────────────────────────────────────────
 
