@@ -21,6 +21,7 @@ import matplotlib.pyplot as plt
 from matplotlib.dates import DateFormatter
 
 from stable_baselines3 import SAC
+from stable_baselines3.common.vec_env import DummyVecEnv, VecNormalize
 from src.room_env import RoomHeatEnv
 
 
@@ -38,6 +39,11 @@ def get_args():
                    help='Path to save the plot (e.g. eval.png). Shows interactively if not set.')
     p.add_argument('--T_comfort_low',  type=float, default=20.0)
     p.add_argument('--T_comfort_high', type=float, default=22.0)
+    p.add_argument('--vec_normalize', type=str, default=None,
+                   help='Path to saved VecNormalize statistics (.pkl). '
+                        'If not set, will look for vec_normalize.pkl in the model directory.')
+    p.add_argument('--bldg_idx', type=int, default=None,
+                   help='Specific building index (0-10) to evaluate. If not set, randomly chosen.')
     return p.parse_args()
 
 
@@ -65,15 +71,17 @@ def load_or_generate(path, days):
 def run_episode(model, env):
     """Run one full episode and collect all relevant signals."""
     records = []
-    obs, _ = env.reset()
+    obs = env.reset()
     done   = False
 
     while not done:
         action, _ = model.predict(obs, deterministic=True)
-        obs, reward, terminated, truncated, info = env.step(action)
-        done = terminated or truncated
+        obs, reward, done_array, info_list = env.step(action)
+        done = done_array[0]
+        info = info_list[0]
+        raw_env = env.envs[0].unwrapped
         records.append({
-            'time':      env.get_cur_time(),
+            'time':      raw_env.get_cur_time(),
             'T_room':    info['T_room'],
             'T_amb':     info['T_amb'],
             'u':         info['u'],              # T_hp_sup actually applied
@@ -81,7 +89,7 @@ def run_episode(model, env):
             'price':     info['price'],
             'E_el_kWh':  info['E_el_kWh'],
             'dev_neg':   info['dev_neg_max'],
-            'reward':    reward,
+            'reward':    reward[0],
         })
 
     return pd.DataFrame(records).set_index('time')
@@ -116,11 +124,16 @@ def plot_results(df, T_low, T_high, save_path=None):
     ax1.grid(axis='y', color='#30363d', linewidth=0.5)
 
     # Shade comfort violations red
-    violations = df['T_room'] < T_low
-    if violations.any():
+    violations_under = df['T_room'] < T_low
+    if violations_under.any():
         ax1.fill_between(t, df['T_room'], T_low,
-                         where=violations, alpha=0.3, color='#f85149',
+                         where=violations_under, alpha=0.3, color='#f85149',
                          label='Under-heating')
+    violations_over = df['T_room'] > T_high
+    if violations_over.any():
+        ax1.fill_between(t, T_high, df['T_room'],
+                         where=violations_over, alpha=0.3, color='#ff7b72',
+                         label='Over-heating')
 
     # ── Panel 2: Supply temperature ───────────────────────────────────────────
     ax2 = axes[1]
@@ -146,7 +159,8 @@ def plot_results(df, T_low, T_high, save_path=None):
     # ── Summary stats ─────────────────────────────────────────────────────────
     total_cost   = (df['price'] * df['E_el_kWh']).sum()
     total_energy = df['E_el_kWh'].sum()
-    pct_comfort  = 100 * (1 - (df['T_room'] < T_low).mean())
+    in_band      = (df['T_room'] >= T_low) & (df['T_room'] <= T_high)
+    pct_comfort  = 100 * in_band.mean()
     n_cycles     = int((df['hp_on'].astype(int).diff().abs() > 0).sum() / 2)
 
     stats = (f"Energy: {total_energy:.1f} kWh  |  "
@@ -182,12 +196,34 @@ def main():
     data = load_or_generate(args.data, args.days)
 
     # Environment
-    env = RoomHeatEnv(
-        disturbances=data,
-        days=args.days,
-        random_init=False,
-        forecast_steps=24,
-    )
+    def make_env():
+        return RoomHeatEnv(
+            disturbances=data,
+            days=args.days,
+            random_init=False,
+            forecast_steps=24,
+            fixed_bldg_idx=args.bldg_idx,
+        )
+    env = DummyVecEnv([make_env])
+
+    # Handle VecNormalize
+    import os
+    vec_path = args.vec_normalize
+    if vec_path is None:
+        # Auto-detect in model directory
+        model_dir = os.path.dirname(args.model)
+        possible_path = os.path.join(model_dir, 'vec_normalize.pkl')
+        if os.path.exists(possible_path):
+            vec_path = possible_path
+
+    if vec_path and os.path.exists(vec_path):
+        print(f"Loading VecNormalize statistics from: {vec_path}")
+        env = VecNormalize.load(vec_path, env)
+        env.training = False
+        env.norm_reward = False
+    else:
+        print("WARNING: Running evaluation WITHOUT VecNormalize statistics. "
+              "If the model was trained with VecNormalize, evaluation will be incorrect!")
 
     # Model
     print(f"Loading model: {args.model}")

@@ -4,13 +4,17 @@ Room Heating Gymnasium Environment
 ====================================
 Wraps the Simulator into a Gymnasium-compatible RL environment.
 
-Observation (53 dims)
+Observation (69 dims)
 ---------------------
   [0:3]   Building states   : T_room, T_wall, T_hp_ret
   [3]     T_amb             : current outdoor temperature  [°C]
   [4]     price_eur_kwh     : current electricity price    [€/kWh]
   [5:29]  Price forecast    : price(k+1) … price(k+24)    [€/kWh]
   [29:53] Weather forecast  : T_amb(k+1) … T_amb(k+24)   [°C]
+  [53:55] Hour encoding     : sin(hour), cos(hour)        [-1, 1]
+  [55:57] Day-of-week enc.  : sin(dow),  cos(dow)         [-1, 1]
+  [57]    Previous action   : last normalised action       [-1, 1]
+  [58:69] Building ID       : one-hot encoded bldg index   [0, 1]
 
 Action (1 dim)
 --------------
@@ -26,7 +30,7 @@ from gymnasium import spaces
 from typing import Dict, Optional
 
 from models.vonovia_model import Building, BUILDING_MODELS
-from models.heatpump_model import HEATPUMP_MODELS
+from models.heatpump_model import iDM_AERO_ALM_4_12
 from src.simulator import Simulator
 
 # ── Observation space bounds ──────────────────────────────────────────────────
@@ -84,7 +88,8 @@ class RoomHeatEnv(gym.Env):
         cycle_weight: float = 0.0,
         noise_level: float = 0.0,
         T_room_set_lower: float = 20.0,
-        T_room_set_upper: float = 26.0,
+        T_room_set_upper: float = 22.0,
+        fixed_bldg_idx: int = None,
     ):
         super().__init__()
 
@@ -94,6 +99,7 @@ class RoomHeatEnv(gym.Env):
         self.comfort_weight = comfort_weight
         self.cycle_weight   = cycle_weight
         self.noise_level    = noise_level
+        self.fixed_bldg_idx = fixed_bldg_idx
 
         self.mdot_HP = mdot_HP
         self.T_room_set_lower = T_room_set_lower
@@ -102,8 +108,7 @@ class RoomHeatEnv(gym.Env):
         self.building_models = BUILDING_MODELS
         self.current_building_params = None
 
-        self.heatpump_models = HEATPUMP_MODELS
-        self.current_heatpump_class = None
+        self.current_heatpump_class = iDM_AERO_ALM_4_12
 
         # ── Disturbance profile ───────────────────────────────────────────────
         self.p = disturbances[['T_amb', 'price_eur_kwh']].copy()
@@ -143,7 +148,11 @@ class RoomHeatEnv(gym.Env):
     def _select_models(self):
         """Randomly select one building model and one heat pump model."""
         # Select building
-        bldg_idx = int(self.np_random.integers(0, len(self.building_models)))
+        if self.fixed_bldg_idx is not None:
+            bldg_idx = self.fixed_bldg_idx
+        else:
+            bldg_idx = int(self.np_random.integers(0, len(self.building_models)))
+        self.current_bldg_idx = bldg_idx
         self.current_building_params = self.building_models[bldg_idx]
 
         self.bldg_model = Building(
@@ -153,9 +162,7 @@ class RoomHeatEnv(gym.Env):
             T_room_set_upper=self.T_room_set_upper,
         )
 
-        # Select heat pump class and instantiate it
-        hp_idx = int(self.np_random.integers(0, len(self.heatpump_models)))
-        self.current_heatpump_class = self.heatpump_models[hp_idx]
+        # Always use iDM AERO ALM 4-12 (single HP model)
         self.hp_model = self.current_heatpump_class()
 
         # Recreate simulator with the selected building + heat pump
@@ -178,6 +185,7 @@ class RoomHeatEnv(gym.Env):
 
         self._cur_steps  = 0
         self.prev_action = None
+        self._prev_norm_action = 0.0   # normalised previous action for obs
         self._hp_was_on  = False
         self.state       = self._build_obs(self._initial_state_dict())
         return self.state.copy(), {}
@@ -205,6 +213,7 @@ class RoomHeatEnv(gym.Env):
         T_hp_sup = float(np.clip(T_hp_sup, self.hp_model.T_flow_min, self.hp_model.T_flow_max))
         T_hp_sup = max(T_hp_sup, state_dict['T_hp_ret'])
         self.prev_action = T_hp_sup
+        self._prev_norm_action = float(action[0])   # store normalised action
 
         # Simulate one step
         result     = self.simulator.get_next_state(state_dict, T_hp_sup, pk)
@@ -265,6 +274,18 @@ class RoomHeatEnv(gym.Env):
         lo, hi = OBS_LIMITS['T_amb']
         low  += [lo] * self.forecast_steps
         high += [hi] * self.forecast_steps
+        # Time features: sin/cos hour, sin/cos day-of-week (range [-1, 1])
+        low  += [-1.0] * 4
+        high += [ 1.0] * 4
+        # Previous action (normalised, range [-1, 1])
+        low  += [-1.0]
+        high += [ 1.0]
+        
+        # Building ID (one-hot encoded, length = len(building_models))
+        num_bldgs = len(self.building_models)
+        low  += [0.0] * num_bldgs
+        high += [1.0] * num_bldgs
+        
         return spaces.Box(
             low=np.array(low, dtype=np.float32),
             high=np.array(high, dtype=np.float32),
@@ -280,36 +301,55 @@ class RoomHeatEnv(gym.Env):
             obs.append(float(self.p.iloc[min(self.t + i, len(self.p) - 1)]['price_eur_kwh']))
         for i in range(1, self.forecast_steps + 1):
             obs.append(float(self.p.iloc[min(self.t + i, len(self.p) - 1)]['T_amb']))
+        # Time features
+        ts   = self.p.index[min(self.t, len(self.p) - 1)]
+        hour = ts.hour + ts.minute / 60.0
+        dow  = ts.dayofweek                        # 0=Mon … 6=Sun
+        obs.append(float(np.sin(2 * np.pi * hour / 24.0)))
+        obs.append(float(np.cos(2 * np.pi * hour / 24.0)))
+        obs.append(float(np.sin(2 * np.pi * dow  /  7.0)))
+        obs.append(float(np.cos(2 * np.pi * dow  /  7.0)))
+        # Previous action (normalised)
+        obs.append(float(self._prev_norm_action))
+        
+        # Building ID (one-hot)
+        bldg_one_hot = [0.0] * len(self.building_models)
+        if hasattr(self, 'current_bldg_idx'):
+            bldg_one_hot[self.current_bldg_idx] = 1.0
+        obs.extend(bldg_one_hot)
+        
         return np.array(obs, dtype=np.float32)
 
     def _reward(self, E_el_kWh: float, price: float, costs: Dict, cycle: bool) -> float:
         """
-        r = comfort_term - electricity_cost - cycle_penalty
+        r = comfort_penalty - electricity_cost - cycle_penalty
 
-        comfort_term:
-            +1.0          if T_room in [20, 22]°C  (flat reward in comfort band)
-            -(T_room-21)² otherwise                (parabola, peak at 21°C)
+        comfort_penalty:
+            0.0                              if T_room in [T_lower, T_upper]
+            -5.0 * (T_lower - T_room)²       if T_room < T_lower  (underheating, harsh)
+            -3.0 * (T_room  - T_upper)²      if T_room > T_upper  (overheating, strong)
 
         electricity_cost = price [€/kWh] * E_el_kWh
 
         cycle_penalty = cycle_weight  if HP switched on↔off this step
         """
-        T_room = costs.get('T_room_last', 21.0)   # fallback; set below in step()
-        scale = 1/1000
+        T_room = costs.get('T_room_last', 21.0)
 
-        # Comfort term: parabola with peak at 21°C, flat in [20, 22]
-        if 20.0 <= T_room <= 22.0:
-            comfort = 1.0
+        # Comfort: asymmetric penalty (under 5×, over 3×)
+        if T_room < self.T_room_set_lower:
+            comfort = -5.0 * (self.T_room_set_lower - T_room) ** 2
+        elif T_room > self.T_room_set_upper:
+            comfort = -3.0 * (T_room - self.T_room_set_upper) ** 2
         else:
-            comfort = -((T_room - 21.0) ** 2)
+            comfort = 0.0
 
         # Electricity cost penalty
         cost_penalty = price * E_el_kWh
 
         # Cycle penalty
-        cycle_penalty = self.cycle_weight if cycle else 0.0
+        cycle_penalty = self.cycle_weight * (1.0 if cycle else 0.0)
 
-        return scale*float(self.comfort_weight * comfort - cost_penalty - cycle_penalty)
+        return float(comfort - cost_penalty - cycle_penalty)
 
     def _get_pk(self, t: int) -> Dict:
         return self.p.iloc[min(t, len(self.p) - 1)].to_dict()

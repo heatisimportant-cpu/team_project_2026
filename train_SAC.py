@@ -34,8 +34,8 @@ import pandas as pd
 
 from stable_baselines3 import SAC
 from stable_baselines3.common.monitor import Monitor
-from stable_baselines3.common.vec_env import DummyVecEnv
-from stable_baselines3.common.callbacks import EvalCallback, CheckpointCallback
+from stable_baselines3.common.vec_env import DummyVecEnv, SubprocVecEnv, VecNormalize
+from stable_baselines3.common.callbacks import EvalCallback, CheckpointCallback, BaseCallback
 
 from src.room_env import RoomHeatEnv
 
@@ -60,17 +60,17 @@ def get_args():
     p.add_argument('--forecast_steps', type=int,   default=24)
 
     # Training
-    p.add_argument('--timesteps',       type=int, default=100_000)
+    p.add_argument('--timesteps',       type=int, default=1_000_000)
     p.add_argument('--run_name',        type=str, default='sac_hp')
     p.add_argument('--seed',            type=int, default=42)
     p.add_argument('--n_eval_episodes', type=int, default=5)
 
     # SAC hyperparameters
-    p.add_argument('--lr',              type=float, default=1e-4)
-    p.add_argument('--gamma',           type=float, default=0.99)
-    p.add_argument('--buffer_size',     type=int,   default=100_000,
+    p.add_argument('--lr',              type=float, default=3e-4)
+    p.add_argument('--gamma',           type=float, default=0.995)
+    p.add_argument('--buffer_size',     type=int,   default=500_000,
                    help='Replay buffer size.')
-    p.add_argument('--learning_starts', type=int,   default=5_000,
+    p.add_argument('--learning_starts', type=int,   default=20_000,
                    help='Steps of random exploration before training starts.')
     p.add_argument('--batch_size',      type=int,   default=256)
     p.add_argument('--tau',             type=float, default=0.005,
@@ -119,6 +119,76 @@ def make_env(disturbances, args, random_init):
     return _init
 
 
+# ── Custom Callbacks & Schedules ─────────────────────────────────────────────
+
+from typing import Callable
+
+def linear_schedule(initial_value: float, final_value: float = 1e-5) -> Callable[[float], float]:
+    """Linear learning rate schedule."""
+    def func(progress_remaining: float) -> float:
+        # progress_remaining starts at 1.0 and goes to 0.0
+        return progress_remaining * (initial_value - final_value) + final_value
+    return func
+
+
+class TensorboardLoggingCallback(BaseCallback):
+    """Custom callback to log specific metrics to TensorBoard per episode."""
+    def __init__(self, verbose=0):
+        super().__init__(verbose)
+        self.env_costs = None
+        self.env_energy = None
+        self.env_comfort_violations = None
+        self.env_cycles = None
+        self.env_steps = None
+        self.env_hp_was_on = None
+
+    def _on_training_start(self) -> None:
+        num_envs = self.training_env.num_envs
+        self.env_costs = [0.0] * num_envs
+        self.env_energy = [0.0] * num_envs
+        self.env_comfort_violations = [0] * num_envs
+        self.env_cycles = [0] * num_envs
+        self.env_steps = [0] * num_envs
+        self.env_hp_was_on = [False] * num_envs
+
+    def _on_step(self) -> bool:
+        infos = self.locals.get("infos", [])
+        dones = self.locals.get("dones", [])
+        
+        for i, info in enumerate(infos):
+            self.env_costs[i] += info.get('energy_cost', 0.0)
+            self.env_energy[i] += info.get('E_el_kWh', 0.0)
+            
+            T_room = info.get('T_room', 21.0)
+            if T_room < 20.0 or T_room > 22.0:
+                self.env_comfort_violations[i] += 1
+                
+            hp_on = info.get('hp_on', False)
+            if hp_on != self.env_hp_was_on[i]:
+                self.env_cycles[i] += 1
+            self.env_hp_was_on[i] = hp_on
+                
+            self.env_steps[i] += 1
+            
+            if dones[i]:
+                pct_comfort = 100.0 * (1.0 - self.env_comfort_violations[i] / max(1, self.env_steps[i]))
+                cycles = self.env_cycles[i] // 2
+                
+                self.logger.record("rollout/ep_cost_eur", self.env_costs[i])
+                self.logger.record("rollout/ep_energy_kWh", self.env_energy[i])
+                self.logger.record("rollout/ep_comfort_pct", pct_comfort)
+                self.logger.record("rollout/ep_hp_cycles", cycles)
+                
+                self.env_costs[i] = 0.0
+                self.env_energy[i] = 0.0
+                self.env_comfort_violations[i] = 0
+                self.env_cycles[i] = 0
+                self.env_steps[i] = 0
+                self.env_hp_was_on[i] = False
+                
+        return True
+
+
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 def main():
@@ -138,8 +208,12 @@ def main():
               "Pass --eval_data data/test.csv for a proper generalisation test.")
 
     # ── Environments ──────────────────────────────────────────────────────────
-    train_env = DummyVecEnv([make_env(train_data, args, random_init=True)])
+    num_envs = 4
+    train_env = SubprocVecEnv([make_env(train_data, args, random_init=True) for _ in range(num_envs)])
+    train_env = VecNormalize(train_env, norm_obs=True, norm_reward=True, clip_obs=10.0)
+
     eval_env  = DummyVecEnv([make_env(eval_data,  args, random_init=False)])
+    eval_env  = VecNormalize(eval_env, norm_obs=True, norm_reward=False, clip_obs=10.0)
 
     # ── Callbacks ─────────────────────────────────────────────────────────────
     eval_freq = 5_000
@@ -160,13 +234,14 @@ def main():
             name_prefix='sac_hp',
             verbose=0,
         ),
+        TensorboardLoggingCallback(),
     ]
 
     # ── SAC model ─────────────────────────────────────────────────────────────
     model = SAC(
         policy          = 'MlpPolicy',
         env             = train_env,
-        learning_rate   = args.lr,
+        learning_rate   = linear_schedule(args.lr) if args.lr > 1e-5 else args.lr,
         gamma           = args.gamma,
         buffer_size     = args.buffer_size,
         learning_starts = args.learning_starts,
@@ -195,6 +270,7 @@ def main():
 
     final_path = os.path.join(run_dir, 'final_model')
     model.save(final_path)
+    train_env.save(os.path.join(run_dir, 'vec_normalize.pkl'))
     print(f"\nDone.  Best model  → {run_dir}/best_model.zip")
     print(f"       Final model → {final_path}.zip")
 
