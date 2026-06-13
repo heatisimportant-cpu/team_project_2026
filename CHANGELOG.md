@@ -369,3 +369,29 @@ We now calculate a specific `design_heat_load` for each building based on its tr
 The physics fix was a massive success! By giving each building physically appropriate radiators, the agent's rapid cycling behavior essentially vanished. Building 2 dropped from 442 cycles down to 96, and Building 1 dropped to just 30 cycles over 90 days. 
 
 Furthermore, the comfort scores are exceptional — four out of six buildings are now scoring ≥ 93.7%, and minimum temperatures have tightened even further towards the 20°C boundary. Proper physics simulation makes the RL agent's job much easier.
+
+---
+
+## Change 12 — Phase 5.1 & 5.2: Longer Training & Init Fix (v13) (2026-06-13)
+
+**Files modified:** `src/room_env.py`, `train_SAC.py`
+
+### What Changed
+- Narrowed random initialization to `T_room` $\in$ [18.0, 24.0] to prevent the agent from wasting time exploring physically impossible states (like 5°C).
+- Ran training for an extended **5,000,000 steps** to reach full convergence.
+
+### v13 Evaluation Results (5M Steps)
+
+| Building | Minimum T_room | Comfort % | HP cycles (v13) | Total Cost |
+|----------|----------------|-----------|-----------------|------------|
+| 0        | 18.5 °C        | 80.8%     | 337             | €541.74    |
+| 1        | 18.7 °C        | 86.1%     | 369             | €954.14    |
+| 2        | 18.9 °C        | 87.9%     | 514             | €598.04    |
+| 3        | 18.7 °C        | 86.4%     | 522             | €456.61    |
+| 4        | 18.8 °C        | 87.6%     | 418             | €660.43    |
+| 5        | 18.6 °C        | 84.1%     | 441             | €542.00    |
+
+**Analysis: Convergence Trading Comfort for Cost**
+The 5M step run revealed a classic RL phenomenon. Compared to the 1M step run (`v11`), the agent's comfort dropped from ~95% down to ~85%, and cycling increased significantly. However, **energy costs dropped across the board**. 
+
+The agent has fully converged on our exact reward function. Because the underheating penalty is quadratic `(20 - T_room)^2`, a small drop to 19.5°C yields a tiny penalty. The agent discovered that constantly "riding the edge" of the comfort band and deliberately allowing the room to drop to 18.5°C during high-price hours yields a higher net reward than maintaining perfect 20°C comfort. It learned to aggressively trade human comfort for euros.

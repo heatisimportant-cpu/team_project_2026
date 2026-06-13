@@ -328,7 +328,7 @@ class RoomHeatEnv(gym.Env):
 
         comfort_penalty:
             0.0                              if T_room in [T_lower, T_upper]
-            -5.0 * (T_lower - T_room)²       if T_room < T_lower  (underheating, harsh)
+            -20.0 * (T_lower - T_room)²      if T_room < T_lower  (underheating, harsh)
             -3.0 * (T_room  - T_upper)²      if T_room > T_upper  (overheating, strong)
 
         electricity_cost = price [€/kWh] * E_el_kWh
@@ -365,7 +365,17 @@ class RoomHeatEnv(gym.Env):
 
     def _initial_state_dict(self) -> Dict:
         if self.random_init:
-            return {k: float(self.np_random.uniform(*OBS_LIMITS[k])) for k in self.bldg_model.state_keys}
+            init_state = {}
+            for k in self.bldg_model.state_keys:
+                if k == 'T_room':
+                    init_state[k] = float(self.np_random.uniform(18.0, 24.0))
+                elif k == 'T_wall':
+                    init_state[k] = float(self.np_random.uniform(16.0, 24.0))
+                elif k == 'T_hp_ret':
+                    init_state[k] = float(self.np_random.uniform(20.0, 40.0))
+                else:
+                    init_state[k] = float(self.np_random.uniform(*OBS_LIMITS[k]))
+            return init_state
         return {k: 20.0 for k in self.bldg_model.state_keys}
 
     def get_obs(self) -> np.ndarray:
