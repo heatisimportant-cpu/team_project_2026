@@ -105,7 +105,9 @@ class RoomHeatEnv(gym.Env):
         self.T_room_set_lower = T_room_set_lower
         self.T_room_set_upper = T_room_set_upper
 
-        self.building_models = BUILDING_MODELS
+        # Sanitize building models: only include those that can be physically heated by a 12kW HP
+        # Criteria: At -10C ambient (30K delta), heat loss must be <= 12kW. So H_ve + H_tr <= 400 W/K
+        self.building_models = [b for b in BUILDING_MODELS if (b['H_ve'] + b['H_tr']) <= 400.0]
         self.current_building_params = None
 
         self.current_heatpump_class = iDM_AERO_ALM_4_12
