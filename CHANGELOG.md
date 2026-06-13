@@ -278,5 +278,33 @@ We evaluated the `v8` model on the 6 sanitized buildings. The results showed a m
 The catastrophic failure mode is completely gone! Previously, buildings dropped to 6.8°C and 16.0°C. Now, across all evaluated buildings, the absolute minimum temperature is **18.5°C**. 
 The remaining underheating (18.5°C - 19.3°C) is purely due to the RL agent "hedging"—allowing a slight comfort penalty to save on electricity costs because the underheating penalty is not severe enough to outweigh the cost savings.
 
-### Next Steps for v9 (Phase 3.1: Advanced Reward Engineering)
-- Implement **Aggressive Asymmetric Penalty**: Increase the underheating penalty drastically (e.g. from `-5.0` to `-20.0`) to force the agent to strictly maintain the 20°C boundary. This should eliminate the final 1.5°C hedging behavior and push comfort above 95%.
+---
+
+## Change 9 — Phase 3.1: Advanced Reward Engineering (2026-06-13)
+
+**Files modified:** `src/room_env.py`
+
+### What Changed
+- **Aggressive Asymmetric Penalty**: Increased the penalty for falling below `T_room_set_lower` (20°C) from `-5.0` to `-20.0`. This makes underheating 4x more painful, forcing the agent to absolutely respect the 20°C boundary.
+
+### v9 Evaluation Results
+
+We evaluated the `v9` model on the 6 sanitized buildings.
+
+| Building | Minimum T_room | Maximum T_room | Comfort % | HP cycles |
+|----------|----------------|----------------|-----------|-----------|
+| 0        | 19.2 °C        | 22.4 °C        | 86.9%     | 197       |
+| 1        | 18.9 °C        | 23.4 °C        | 93.2%     | 81        |
+| 2        | 19.1 °C        | 22.0 °C        | 89.3%     | 442       |
+| 3        | 19.5 °C        | 23.5 °C        | 98.1%     | 386       |
+| 4        | 19.5 °C        | 22.2 °C        | 89.4%     | 199       |
+| 5        | 19.0 °C        | 22.2 °C        | 88.3%     | 225       |
+
+**Analysis:**
+The aggressive penalty successfully pushed temperatures up! Minimums are now firmly hovering around 19.0 - 19.5°C, and comfort scores rose to between 87% and 98%.
+
+However, we uncovered a new issue: **Rapid Cycling**. 
+Notice the extreme number of HP cycles (442 on Building 2, 386 on Building 3). Because the agent is terrified of the `-20.0` penalty but receives zero reward for keeping the house at 21.5°C, it views pre-heating as an unnecessary expense. Instead of deep-charging the thermal mass during cheap hours, it waits until the temperature hits exactly 20.0°C and then rapidly toggles the heat pump on and off to perfectly ride the boundary line.
+
+### Next Steps for v10 (Phase 3.2: Pre-Heating Bonus)
+- Implement a **Pre-Heating Bonus**: Give the agent a continuous `+1.0` reward for keeping the room in the upper half of the comfort band (`T_room >= 20.5`). This gives the agent a clear financial incentive to over-heat the house during cheap hours so it can coast through expensive hours without dropping below 20.0°C, thereby eliminating the rapid cycling.

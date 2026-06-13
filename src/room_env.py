@@ -337,9 +337,9 @@ class RoomHeatEnv(gym.Env):
         """
         T_room = costs.get('T_room_last', 21.0)
 
-        # Comfort: asymmetric penalty (under 5×, over 3×)
+        # Comfort: asymmetric penalty (under 20×, over 3×)
         if T_room < self.T_room_set_lower:
-            comfort = -5.0 * (self.T_room_set_lower - T_room) ** 2
+            comfort = -20.0 * (self.T_room_set_lower - T_room) ** 2
         elif T_room > self.T_room_set_upper:
             comfort = -3.0 * (T_room - self.T_room_set_upper) ** 2
         else:
