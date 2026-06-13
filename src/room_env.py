@@ -327,9 +327,9 @@ class RoomHeatEnv(gym.Env):
         r = comfort_penalty - electricity_cost - cycle_penalty
 
         comfort_penalty:
-            0.0                              if T_room in [T_lower, T_upper]
-            -20.0 * (T_lower - T_room)²      if T_room < T_lower  (underheating, harsh)
-            -3.0 * (T_room  - T_upper)²      if T_room > T_upper  (overheating, strong)
+            0.0                                          if T_room in [T_lower, T_upper]
+            -20.0*|T_lower-T| - 20.0*(T_lower-T)²        if T_room < T_lower  (harsh linear+quadratic)
+            -3.0 * (T_room  - T_upper)²                  if T_room > T_upper  (overheating)
 
         electricity_cost = price [€/kWh] * E_el_kWh
 
@@ -337,9 +337,12 @@ class RoomHeatEnv(gym.Env):
         """
         T_room = costs.get('T_room_last', 21.0)
 
-        # Comfort: asymmetric penalty (under 20×, over 3×)
+        # Comfort: asymmetric penalty
+        # Underheating is penalized with both a linear and squared term to prevent
+        # the agent from exploiting the "soft bottom" of a purely squared penalty near 19.9°C.
         if T_room < self.T_room_set_lower:
-            comfort = -20.0 * (self.T_room_set_lower - T_room) ** 2
+            delta = self.T_room_set_lower - T_room
+            comfort = -20.0 * delta - 20.0 * (delta**2)
         elif T_room > self.T_room_set_upper:
             comfort = -3.0 * (T_room - self.T_room_set_upper) ** 2
         else:
