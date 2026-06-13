@@ -52,11 +52,14 @@ class Building:
         p['volume_air'] = area * p['height_room']
         p['H_ve_tr']    = p['H_ve'] + p['H_tr']
         p['H_tr_heavy'] = p['H_tr'] - p['H_tr_light']
-        # i4b uses H_UFH_SPEC * area for underfloor heating.
-        # This building has radiators → derive from datasheet design conditions:
-        # Q=10968 W at T_sup=55°C, T_ret=45°C (T_mean=50°C), T_room=20°C
-        # H_rad_con = Q / (T_mean - T_room) = 10968 / (50-20) = 365.6 W/K
-        p['H_rad_con']  = 10968.0 / (50.0 - 20.0)  # W/K
+        
+        # Radiator coupling coefficient
+        # Assume radiators are sized for peak heat loss at ΔT = 30K (T_amb = -10°C, T_room = 20°C)
+        # with a 20% oversizing factor.
+        design_heat_load = p.get('design_heat_load', p['H_ve_tr'] * 30.0 * 1.2)
+        # Design radiator temperatures: T_sup=55°C, T_ret=45°C -> T_mean=50°C
+        # H_rad_con = Q / (T_mean - T_room)
+        p['H_rad_con']  = design_heat_load / (50.0 - 20.0)  # W/K
 
         p['C_air']   = RHO_AIR * C_AIR_SPEC * p['volume_air']
         p['C_int']   = C_INT_SPEC * area
@@ -174,6 +177,7 @@ vonovia_model = {
 
     # Name
     'name': 'vonovia_model',
+    'design_heat_load': 10968.0,
 }
 
 sfh_1919_1948_0_soc = {

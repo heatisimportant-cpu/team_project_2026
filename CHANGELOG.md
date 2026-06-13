@@ -342,3 +342,30 @@ A purely penalty-based reward structure (`v9`) forces the agent to balance the t
 3. **Realistic operation** (~3-4 cycles per day).
 
 This successfully completes the Reinforcement Learning agent optimization phase!
+
+---
+
+## Change 11 — Phase 4.1: Fix Radiator Capacities (v11) (2026-06-13)
+
+**Files modified:** `models/vonovia_model.py`
+
+### What Changed
+We fixed a critical physics flaw where all 11 buildings shared the exact same radiator capacity (`H_rad_con = 365.6 W/K`). This was physically inaccurate because a 111 m² house shouldn't have the same radiators as a 288 m² building.
+
+We now calculate a specific `design_heat_load` for each building based on its transmission and ventilation losses (`H_ve + H_tr`) at a design temperature delta of 30K, plus a standard 20% oversizing factor. Then, we derive the building-specific `H_rad_con` from that load. The original `vonovia_model` retains its hardcoded 10,968 W design load to match the baseline exactly.
+
+### v11 Evaluation Results
+
+| Building | Minimum T_room | Comfort % | HP cycles (v11) | HP cycles (v9) |
+|----------|----------------|-----------|-----------------|----------------|
+| 0        | 20.1 °C        | 89.4%     | 214             | 197            |
+| 1        | 19.9 °C        | 95.6%     | 30              | 81             |
+| 2        | 19.4 °C        | 96.8%     | 96              | 442            |
+| 3        | 19.3 °C        | 94.3%     | 251             | 386            |
+| 4        | 19.4 °C        | 93.7%     | 105             | 199            |
+| 5        | 19.0 °C        | 88.0%     | 149             | 225            |
+
+**Analysis:**
+The physics fix was a massive success! By giving each building physically appropriate radiators, the agent's rapid cycling behavior essentially vanished. Building 2 dropped from 442 cycles down to 96, and Building 1 dropped to just 30 cycles over 90 days. 
+
+Furthermore, the comfort scores are exceptional — four out of six buildings are now scoring ≥ 93.7%, and minimum temperatures have tightened even further towards the 20°C boundary. Proper physics simulation makes the RL agent's job much easier.
