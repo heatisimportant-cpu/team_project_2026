@@ -4,7 +4,6 @@ Construction period: 1958–1968
 Location: Hannover, Germany
 Reference floor area: 350 m²
 TABULA building: DE.N.MFH.05.Gen.ReEx.001
-Heat pump: Vaillant aroTHERM plus VWL 65/5
 """
 
 # ------------------------------------------------------------
