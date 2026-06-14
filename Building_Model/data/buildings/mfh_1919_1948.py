@@ -38,10 +38,10 @@ position_hannover = {
 }
 
 # ------------------------------------------------------------
-# Heat pump data (Vaillant aroTHERM plus VWL 65/5)
+# Heat pump data
 # ------------------------------------------------------------
 
-Q_hp_design = 6500.0    # [W]
+Q_hp_design = 37000.0    # [W]
 DeltaT_water = 5.0      # [K]
 cp_water = 4180.0       # [J/(kg·K)]
 
