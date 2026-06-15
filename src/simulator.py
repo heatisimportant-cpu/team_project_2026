@@ -48,6 +48,14 @@ class Simulator:
         # Build initial state array in the order the ODE expects
         x_init_np = np.array([x_init[key] for key in state_keys])
 
+        # ── PHYSICS CAPPING ───────────────────────────────────────────────────
+        # Cap T_hp_sup (uk) so the agent cannot request more heat than the 
+        # cascade can physically produce. Without this, the ODE solves assuming 
+        # infinite heat is available, and the RL agent learns to cheat.
+        Q_max_W = self.hp_model.get_max_heating_capacity(pk['T_amb'], uk) * 1000.0
+        T_hp_sup_max = x_init['T_hp_ret'] + (Q_max_W / (self.bldg_model.mdot_hp * 4181.0))
+        uk = min(uk, T_hp_sup_max)
+
         # Build input list: T_hp_sup first, then disturbances
         input_dict   = {'T_hp_sup': uk, **pk}
         input_values = [input_dict[key] for key in input_keys]

@@ -234,12 +234,20 @@ def main():
     print(f"Running {args.days}-day episode...")
     df = run_episode(model, env)
 
+    # Fetch building params
+    bldg_params = env.get_attr('current_building_params')[0]
+    bldg_name = bldg_params.get('name', f"Building {args.bldg_idx}")
+    num_pumps = int(bldg_params.get('num_pumps', 1))
+
     # Summary
-    print(f"\n── Results ──────────────────────────────")
+    print(f"\n=== Evaluating {bldg_name} ===")
+    print(f"── Results ──────────────────────────────")
+
     print(f"  Steps         : {len(df)}")
     print(f"  T_room range  : {df['T_room'].min():.1f} – {df['T_room'].max():.1f} °C")
     print(f"  T_amb range   : {df['T_amb'].min():.1f} – {df['T_amb'].max():.1f} °C")
     print(f"  T_sup range   : {df['u'].min():.1f} – {df['u'].max():.1f} °C")
+    print(f"  Num pumps     : {num_pumps}")
 
     # Plot
     stats = plot_results(df, args.T_comfort_low, args.T_comfort_high, args.save)

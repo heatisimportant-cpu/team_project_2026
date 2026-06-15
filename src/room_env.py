@@ -4,7 +4,7 @@ Room Heating Gymnasium Environment
 ====================================
 Wraps the Simulator into a Gymnasium-compatible RL environment.
 
-Observation (69 dims)
+Observation (63 dims)
 ---------------------
   [0:3]   Building states   : T_room, T_wall, T_hp_ret
   [3]     T_amb             : current outdoor temperature  [°C]
@@ -14,7 +14,7 @@ Observation (69 dims)
   [53:55] Hour encoding     : sin(hour), cos(hour)        [-1, 1]
   [55:57] Day-of-week enc.  : sin(dow),  cos(dow)         [-1, 1]
   [57]    Previous action   : last normalised action       [-1, 1]
-  [58:69] Building ID       : one-hot encoded bldg index   [0, 1]
+  [58:63] Building physics  : H_tr, H_ve, c_bldg, area_floor, num_pumps
 
 Action (1 dim)
 --------------
@@ -29,8 +29,9 @@ import gymnasium as gym
 from gymnasium import spaces
 from typing import Dict, Optional
 
-from models.vonovia_model import Building, BUILDING_MODELS
-from models.heatpump_model import iDM_AERO_ALM_4_12
+from models import ALL_BUILDING_MODELS as BUILDING_MODELS
+from models.vonovia_model import Building
+from models.heatpump_model import Cascaded_iDM_AERO_ALM_4_12
 from src.simulator import Simulator
 
 # ── Observation space bounds ──────────────────────────────────────────────────
@@ -105,12 +106,10 @@ class RoomHeatEnv(gym.Env):
         self.T_room_set_lower = T_room_set_lower
         self.T_room_set_upper = T_room_set_upper
 
-        # Sanitize building models: only include those that can be physically heated by a 12kW HP
-        # Criteria: At -10C ambient (30K delta), heat loss must be <= 12kW. So H_ve + H_tr <= 400 W/K
-        self.building_models = [b for b in BUILDING_MODELS if (b['H_ve'] + b['H_tr']) <= 400.0]
+        self.building_models = BUILDING_MODELS
         self.current_building_params = None
 
-        self.current_heatpump_class = iDM_AERO_ALM_4_12
+        self.current_heatpump_class = Cascaded_iDM_AERO_ALM_4_12
 
         # ── Disturbance profile ───────────────────────────────────────────────
         self.p = disturbances[['T_amb', 'price_eur_kwh']].copy()
@@ -164,8 +163,10 @@ class RoomHeatEnv(gym.Env):
             T_room_set_upper=self.T_room_set_upper,
         )
 
-        # Always use iDM AERO ALM 4-12 (single HP model)
-        self.hp_model = self.current_heatpump_class()
+        # Initialize cascaded array based on building's capacity needs
+        self.hp_model = self.current_heatpump_class(
+            num_units=self.current_building_params.get('num_pumps', 1)
+        )
 
         # Recreate simulator with the selected building + heat pump
         self.simulator = Simulator(
@@ -283,10 +284,9 @@ class RoomHeatEnv(gym.Env):
         low  += [-1.0]
         high += [ 1.0]
         
-        # Building ID (one-hot encoded, length = len(building_models))
-        num_bldgs = len(self.building_models)
-        low  += [0.0] * num_bldgs
-        high += [1.0] * num_bldgs
+        # Contextual physical parameters (H_tr, H_ve, c_bldg, area_floor, num_pumps)
+        low  += [0.0] * 5
+        high += [1.0] * 5
         
         return spaces.Box(
             low=np.array(low, dtype=np.float32),
@@ -314,11 +314,16 @@ class RoomHeatEnv(gym.Env):
         # Previous action (normalised)
         obs.append(float(self._prev_norm_action))
         
-        # Building ID (one-hot)
-        bldg_one_hot = [0.0] * len(self.building_models)
-        if hasattr(self, 'current_bldg_idx'):
-            bldg_one_hot[self.current_bldg_idx] = 1.0
-        obs.extend(bldg_one_hot)
+        # Contextual physical parameters (Normalised)
+        bldg = self.current_building_params
+        if bldg is not None:
+            obs.append(float(bldg['H_tr']) / 2000.0)                 # Max ~1500 W/K
+            obs.append(float(bldg['H_ve']) / 1000.0)                 # Max ~500 W/K
+            obs.append(float(bldg['c_bldg']) / 100.0)                # Max ~80 MJ/K
+            obs.append(float(bldg.get('area_floor', 150.0)) / 600.0) # Max ~600 m2
+            obs.append(float(bldg.get('num_pumps', 1.0)) / 5.0)      # Max 4 pumps
+        else:
+            obs.extend([0.0] * 5)
         
         return np.array(obs, dtype=np.float32)
 

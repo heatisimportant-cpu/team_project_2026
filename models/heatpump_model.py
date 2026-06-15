@@ -213,3 +213,21 @@ if __name__ == "__main__":
           f"{hp.heater_required(12.0, -10, 55):.1f} kW")
     print(f"  In limits A2/W35  : {hp.is_within_operating_limits(2, 35)}")
     print(f"  In limits A-25/W35: {hp.is_within_operating_limits(-25, 35)}")
+
+class Cascaded_iDM_AERO_ALM_4_12(iDM_AERO_ALM_4_12):
+    """
+    Cascaded array of iDM AERO ALM 4-12 units operating in parallel.
+    The total capacity scales with num_units.
+    Minimum power remains that of 1 unit.
+    Maximum power is that of N units.
+    COP math remains identical.
+    """
+    def __init__(self, num_units=1, params=None):
+        super().__init__(params)
+        self.num_units = max(1, int(num_units))
+        
+        # Scale maximums by the number of cascaded units
+        self.P_el_max *= self.num_units
+        self.heater_power *= self.num_units
+        
+        # P_el_min stays the same because a cascade can spin down to just 1 unit running at minimum

@@ -418,3 +418,104 @@ To close the loophole discovered in `v13`, we modified the underheating penalty 
 
 **Analysis:**
 A massive success! The linear term completely closed the 18.5°C loophole. Minimum temperatures are now tightly clustered just below the 20°C boundary (19.3°C – 19.7°C). Comfort jumped back to ~95% averages, and compressor cycles halved back to a healthy 2–3 starts per day. This agent is robust, fully-converged, and ready for deployment.
+
+---
+
+## Change 7 — Roadmap V3 (Phases 1 & 2): MFH & Cascaded Heat Pumps (2026-06-14)
+
+**Files modified:** `models/mfh_*.py`, `models/vonovia_model.py`, `models/__init__.py`, `models/heatpump_model.py`, `src/room_env.py`
+
+### Phase 1: Multi-Family House (MFH) Integration & Dynamic Scaling
+**Problem:** We introduced massive multi-family houses (MFH). The old codebase assumed small single-family houses (SFH) with hardcoded heat pump capacities. Furthermore, there was a hidden bug: SFH files defined heat loss as absolute `W/K`, but MFH files defined it as specific `W/(m²K)`.
+
+**What changed:**
+1. **Cleaned individual building files**
+   - *I changed:* Removed hardcoded `num_pumps` and `mdot_hp = ...` lines from all 4 `mfh_*.py` files and `vonovia_model.py`.
+   - *Because:* Hardcoding these values inside the physics files is messy and inflexible. We want them to be calculated dynamically.
+2. **Created `models/__init__.py` (Central Registry)**
+   - *I changed:* Created a new file to load all 20 buildings and added a `calculate_required_pumps(bldg_dict)` function.
+   - *Because:* We needed a central place to process the buildings. This function calculates peak heat loss at -10°C, divides it by 13kW, and automatically assigns the exact number of pumps needed (from 1 up to 4).
+3. **Fixed the Physics Unit Bug**
+   - *I changed:* Inside the new function, I added logic: `if is_mfh: bldg_dict['H_ve'] = bldg_dict['H_ve'] * area`.
+   - *Because:* If we fed specific `W/(m²K)` directly into the simulator, the MFH buildings would have acted like they were perfectly insulated (zero heat loss!).
+4. **Dynamic Water Flow Rate**
+   - *I changed:* Added `bldg_dict['mdot_hp'] = 0.27 * num_pumps`.
+   - *Because:* A cascade of 4 pumps pushes 4 times as much water. The physics ODE solver needs to know this.
+
+### Phase 2: Cascaded Heat Pump Architecture
+**Problem:** MFH buildings need up to 52kW of heat, but the `iDM_AERO_ALM_4_12` model only provides 13kW. We also had an artificial filter in `room_env.py` that crashed or skipped "leaky" houses.
+
+**What changed:**
+1. **Created Cascaded Heat Pump Class (`models/heatpump_model.py`)**
+   - *I changed:* Added `class Cascaded_iDM_AERO_ALM_4_12(iDM_AERO_ALM_4_12)`.
+   - *I changed:* Inside `__init__`, added `self.P_el_max *= self.num_units`.
+   - *Because:* A cascaded system acts exactly like the base pump (same COP curve, same minimum power draw), but its maximum electrical limit and heating output scale linearly with the number of units.
+2. **Removed Artificial House Filter (`src/room_env.py`)**
+   - *I changed:* Deleted the line `self.building_models = [b for b in BUILDING_MODELS if (b['H_ve'] + b['H_tr']) <= 400.0]`.
+   - *Because:* This filter excluded "leaky" houses that a single 12kW pump couldn't handle. With cascaded pumps, any house can be heated, so the filter is gone.
+3. **Wired up the Cascaded Pump (`src/room_env.py`)**
+   - *I changed:* `self.hp_model = iDM_AERO_ALM_4_12()` → `self.hp_model = Cascaded_iDM_AERO_ALM_4_12(num_units=self.current_building_params['num_pumps'])`
+   - *Because:* When the environment randomly picks a building at reset, it now instantly spins up an array of the exact number of pumps that specific building needs.
+
+---
+
+## Change 8 — Roadmap V3 (Phase 3.0): Physics Exploit Fix (2026-06-15)
+
+**Files modified:** `src/simulator.py`
+
+### Physics Loophole Fix
+**Problem:** The RL agent controls the heat pump by requesting a supply temperature (`T_hp_sup`). The ODE solver mathematically integrates the room temperature assuming the heat pump instantly and perfectly provided enough heat to reach that temperature. If the RL agent requested a crazy temperature requiring 200kW of heat, the ODE would give it 200kW, even if the building's heat pump cascade maxed out at 52kW! The RL agent could learn to cheat the laws of thermodynamics.
+
+**What changed:**
+- *I changed:* In `src/simulator.py`, before the `solve_ivp` ODE solver runs, I added a hard cap.
+- *I changed:* It calculates `Q_max_W = self.hp_model.get_max_heating_capacity(...)` and converts that into the maximum physically achievable supply temperature. It then runs `uk = min(uk, T_hp_sup_max)`.
+- *Because:* This forces the agent's actions to stay within the strict thermodynamic limits of the heat pump cascade. The ODE solver now accurately simulates real-world constraints.
+
+---
+
+## Change 9 — Roadmap V3 (Phase 3.1): Contextual RL (2026-06-15)
+
+**Files modified:** `src/room_env.py`
+
+### Contextual RL Migration (Teaching the Agent Physics)
+**Problem:** Previously, the environment passed a "One-Hot ID" to the RL agent to tell it which building it was controlling (e.g., `[0, 0, 1, 0, 0]`). The agent just had to blindly memorize: *"Ah, Building #3 is leaky."* This is inflexible. If we added a new building, the neural network would break.
+
+**What changed:**
+1. **Removed the One-Hot ID**
+   - *I changed:* Stripped out the one-hot building ID from `_build_obs` and `_build_obs_space`, shrinking the observation space from 69 dims to 63 dims.
+   - *Because:* We want to replace it with the actual physics of the building.
+
+2. **Injected 5 Physical Parameters**
+   - *I changed:* Every step, we now pass 5 physical values to the neural network:
+     - `H_tr`: Envelope heat loss (how fast heat escapes through walls/windows).
+     - `H_ve`: Ventilation heat loss (how fast heat escapes through drafts).
+     - `c_bldg`: Thermal mass (how much heat the concrete/brick can store like a battery).
+     - `area_floor`: The size of the building.
+     - `num_pumps`: The maximum heating power available (1 to 4 pumps).
+   - *Because:* By feeding these variables, the agent actually learns the laws of thermodynamics. It learns: *"If `H_tr` is high, the house loses heat fast, so I must keep the pump running."*
+
+3. **Normalization of the Physics Variables**
+   - *I changed:* The variables are divided by theoretical maximums (e.g. `H_tr / 2000.0`, `num_pumps / 5.0`).
+   - *Because:* Neural networks (especially in SAC) get mathematically confused if you feed them raw numbers of vastly different sizes (like a temperature of `21.0` mixed with a heat loss of `1500.0`). Dividing them squishes every number into a tight, safe range between `0.0` and `1.0`, keeping the training stable.
+
+4. **Safe Dictionary Lookups**
+   - *I changed:* Used `bldg.get('area_floor', 150.0)` instead of direct access.
+   - *Because:* This safely checks if the key exists. If an older building model is missing the area or pump count, it gracefully defaults instead of crashing the simulator.
+
+---
+
+## Change 10 — Evaluation Script Enhancements (2026-06-15)
+
+**Files modified:** `evaluate.py`
+
+### Better Logging for Contextual RL
+**Problem:** The evaluation script was hardcoded to print `=== Evaluating Building 0 ===` which made it difficult to tell which specific physical building model (and its required heat pump count) was actually being evaluated. 
+
+**What changed:**
+1. **Dynamic Building Name and Pump Extraction**
+   - *I changed:* In `evaluate.py`, the environment parameters (`env.get_attr('current_building_params')[0]`) are now parsed to extract the building's actual string `name` and calculated `num_pumps`.
+   - *Because:* This provides immediate clarity in the logs. We can now see exactly which building is failing or succeeding.
+
+2. **Formatted Summary Printout**
+   - *I changed:* The summary printout was updated to `=== Evaluating {bldg_name} ===` and a new line `Num pumps : {num_pumps}` was added right alongside `Total energy`.
+   - *Because:* It makes grepping and parsing the evaluation logs substantially easier and explicitly ties the Contextual RL performance to the specific building physics in the terminal output.
