@@ -240,6 +240,7 @@ def main():
     # ── SAC model ─────────────────────────────────────────────────────────────
     model = SAC(
         policy          = 'MlpPolicy',
+        policy_kwargs   = dict(net_arch=[512, 512, 512]),
         env             = train_env,
         learning_rate   = linear_schedule(args.lr) if args.lr > 1e-5 else args.lr,
         gamma           = args.gamma,
