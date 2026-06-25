@@ -11,22 +11,19 @@ Observation (58 dims)
   [4]     price_eur_kwh     : current electricity price    [€/kWh]
   [5:29]  Price forecast    : price(k+1) … price(k+24)    [€/kWh]
   [29:53] Weather forecast  : T_amb(k+1) … T_amb(k+24)   [°C]
-  [53]    H_ve              : ventilation losses           [W/K]  (normalised)
-  [54]    H_tr              : envelope transmission        [W/K]  (normalised)
-  [55]    c_bldg            : thermal mass                 [Wh/m²K] (normalised)
-  [56]    area_floor        : floor area                   [m²]  (normalised)
-  [57]    mdot_hp           : HP mass flow rate            [kg/s] (normalised)
-  Note: T_amb_lim excluded — constant 20 °C across all building models.
+  [53:57] Cyclical time     : sin(hour), cos(hour), sin(day-of-year), cos(day-of-year)
+  [57]    Heating cutoff    : 1.0 if T_amb >= T_amb_lim this step, else 0.0
 
 Action (1 dim)
 --------------
   Normalized supply temperature in [-1, 1]
   mapped to [T_HP_MIN, T_HP_MAX] = [20, 65] °C
 
-Reward
-------
-  r = comfort_weight * comfort - price * E_el_kWh - cycle_penalty
-  comfort = -(T_room - 21)²   (parabola, peak at 21 °C)
+Disturbances input
+-------------------
+  T_amb, price_eur_kwh   : required
+  Qdot_solar             : optional, defaults to 0 if absent [W]
+  Qdot_internal          : optional, defaults to 0 if absent [W]
 
 """
 
@@ -52,16 +49,6 @@ OBS_LIMITS = {
 T_HP_MIN = 20.0   # °C  — HP minimum supply temperature
 T_HP_MAX = 65.0   # °C  — HP maximum supply temperature
 
-# Building parameter bounds 
-BLDG_PARAM_LIMITS = {
-    'H_ve':       (40.0,  200.0),   
-    'H_tr':       (100.0, 1100.0),  
-    'c_bldg':     (20.0,   90.0),   
-    'area_floor': (80.0,  350.0),   
-    'mdot_hp':    (0.18,   0.35),   
-}
-BLDG_PARAM_KEYS = list(BLDG_PARAM_LIMITS.keys())
-
 
 class RoomHeatEnv(gym.Env):
     """Gymnasium environment for heat pump space heating control.
@@ -70,7 +57,10 @@ class RoomHeatEnv(gym.Env):
     ----------
     disturbances : pd.DataFrame
         DatetimeIndex, columns: T_amb [°C], price_eur_kwh [€/kWh].
-        Optional column: Qdot_gains [W] — defaults to 0 if absent.
+        Optional columns: Qdot_solar [W], Qdot_internal [W] -- each
+        defaults to 0 if absent. Kept separate rather than pre-summed,
+        so downstream benchmarking (e.g. heating-curve + PID baseline)
+        can use each disturbance independently.
     mdot_HP : float
         HP mass flow rate [kg/s].
     delta_t : int
@@ -79,17 +69,33 @@ class RoomHeatEnv(gym.Env):
         Episode length in days. None = full dataset length.
     random_init : bool
         Randomise start index and initial state on each reset().
-    randomise_building : bool
-        Randomise building parameters on each reset(). If curriculum_steps > 0
-        the sampling range widens gradually from vonovia_model ± 0 to the full
-        BLDG_PARAM_LIMITS over the first curriculum_steps environment steps.
-    curriculum_steps : int
-        Number of env steps over which the building sampling range widens from
-        the base building to the full BLDG_PARAM_LIMITS. 0 = full range immediately.
     forecast_steps : int
         Hours ahead for price + weather forecast in observation.
     comfort_weight : float
-        Penalty weight for comfort violations in reward.
+        Penalty weight for comfort violations in reward (tier 1 -- dominant).
+    cost_weight : float
+        Penalty weight for electricity cost in reward (tier 2).
+    cycle_weight : float
+        Penalty weight for HP on/off cycling in reward (tier 3 -- smallest).
+    comfort_penalty_cap : float
+        Maximum value of the squared comfort deviation, in (°C)^2, before
+        weighting. Bounds the worst-case single-step penalty so pathological
+        excursions (mainly seen during early random exploration, before the
+        policy has learned anything) don't create extreme outlier Q-value
+        targets that are disproportionately hard for the critic to fit.
+        Default 100.0 = a 10°C deviation; deviations beyond that are
+        already a total loss of control and don't need to be penalized
+        even harder to convey that.
+    comfort_inband_weight : float
+        Small weight on a gentle ((T_room-center)/half_width)^2 gradient
+        INSIDE the comfort band. A pure zero-inside-band reward gives no
+        learning signal once the policy is "good enough", which can cause
+        training to plateau with no incentive to refine further. Default
+        0.005 -- validated numerically so the worst in-band penalty (right
+        at either edge) stays below even a 0.1degC violation just outside
+        the band (the first value tried, 0.1, was NOT small enough and
+        actually made sitting at the edge worse than a tiny violation
+        outside it -- caught by testing rather than assumed).
     noise_level : float
         Std-dev of Gaussian noise added to observations.
     T_room_set_lower : float
@@ -107,44 +113,51 @@ class RoomHeatEnv(gym.Env):
         delta_t: int = 3600,
         days: Optional[int] = None,
         random_init: bool = False,
-        randomise_building: bool = False,
-        curriculum_steps: int = 0,
         forecast_steps: int = 24,
         comfort_weight: float = 0.0,
+        cost_weight: float = 1.0,
         cycle_weight: float = 0.0,
+        comfort_penalty_cap: float = 100.0,
+        comfort_inband_weight: float = 0.005,
         noise_level: float = 0.0,
         T_room_set_lower: float = 20.0,
-        T_room_set_upper: float = 26.0,
+        T_room_set_upper: float = 22.0,
     ):
         super().__init__()
 
-        self.delta_t            = delta_t
-        self.random_init        = random_init
-        self.randomise_building = randomise_building
-        self.curriculum_steps   = curriculum_steps
-        self.forecast_steps     = forecast_steps
-        self.comfort_weight     = comfort_weight
-        self.cycle_weight       = cycle_weight
-        self.noise_level        = noise_level
-        self.T_room_set_lower   = T_room_set_lower
-        self.T_room_set_upper   = T_room_set_upper
-        self._default_mdot_HP   = mdot_HP
-        self._total_steps       = 0   # global env step counter for curriculum
+        self.delta_t               = delta_t
+        self.random_init           = random_init
+        self.forecast_steps        = forecast_steps
+        self.comfort_weight        = comfort_weight
+        self.cost_weight           = cost_weight
+        self.cycle_weight          = cycle_weight
+        self.comfort_penalty_cap   = comfort_penalty_cap
+        self.comfort_inband_weight = comfort_inband_weight
+        self.noise_level           = noise_level
+        self.T_room_set_lower      = T_room_set_lower
+        self.T_room_set_upper      = T_room_set_upper
 
         # ── Disturbance profile ───────────────────────────────────────────────
         self.p = disturbances[['T_amb', 'price_eur_kwh']].copy()
-        self.p['Qdot_gains'] = (
-            disturbances['Qdot_gains']
-            if 'Qdot_gains' in disturbances.columns
-            else 0.0
-        )
+        for col in ('Qdot_solar', 'Qdot_internal'):
+            self.p[col] = (
+                disturbances[col] if col in disturbances.columns else 0.0
+            )
         self.p = self.p.resample(f'{delta_t}s').ffill().astype(np.float32)
 
         # ── Models & simulator ────────────────────────────────────────────────
-        # Initialise with vonovia_model as the default; reset() will resample
-        # if randomise_building=True.
-        self.hp_model = iDM_AERO_ALM_4_12()
-        self._init_building(vonovia_model, mdot_HP)
+        self.bldg_model = Building(
+            params=vonovia_model,
+            mdot_hp=mdot_HP,
+            T_room_set_lower=T_room_set_lower,
+            T_room_set_upper=T_room_set_upper,
+        )
+        self.hp_model  = iDM_AERO_ALM_4_12()
+        self.simulator = Simulator(
+            hp_model=self.hp_model,
+            bldg_model=self.bldg_model,
+            timestep=delta_t,
+        )
 
         # ── Episode length ────────────────────────────────────────────────────
         if days is not None:
@@ -172,21 +185,6 @@ class RoomHeatEnv(gym.Env):
     def reset(self, seed=None, **kwargs):
         super().reset(seed=seed)
 
-        # Randomise building parameters each episode if requested 
-        if self.randomise_building:
-            sampled_params = dict(vonovia_model)   # start from a full valid base
-            if self.curriculum_steps > 0:
-                progress = float(np.clip(self._total_steps / self.curriculum_steps, 0.0, 1.0))
-            else:
-                progress = 1.0
-            for key, (lo, hi) in BLDG_PARAM_LIMITS.items():
-                base_val = float(vonovia_model.get(key, (lo + hi) / 2.0))
-                cur_lo   = base_val - progress * (base_val - lo)
-                cur_hi   = base_val + progress * (hi - base_val)
-                sampled_params[key] = float(self.np_random.uniform(cur_lo, cur_hi))
-            mdot = sampled_params.pop('mdot_hp')
-            self._init_building(sampled_params, mdot)
-
         if self.random_init:
             max_start = len(self.p) - self.max_steps - self.forecast_steps - 1
             self.t = int(self.np_random.integers(0, max(1, max_start)))
@@ -205,22 +203,22 @@ class RoomHeatEnv(gym.Env):
             for i, key in enumerate(self.bldg_model.state_keys)
         }
         pk = self._get_pk(self.t)
+        pk['Qdot_gains'] = pk['Qdot_solar'] + pk['Qdot_internal']
 
         # Denormalise action → physical supply temperature
         T_hp_sup = self._denorm_action(float(action[0]))
 
         # Heating cutoff: no heating when T_amb ≥ T_amb_lim
-        if pk['T_amb'] < self.bldg_model.params['T_amb_lim']:
+        heating_cutoff_active = pk['T_amb'] >= self.bldg_model.params['T_amb_lim']
+        if not heating_cutoff_active:
             T_hp_sup = max(
                 T_hp_sup + self.bldg_model.params['T_offset'],
                 state_dict['T_hp_ret'],
             )
+            T_hp_sup = float(np.clip(T_hp_sup, self.hp_model.T_flow_min, self.hp_model.T_flow_max))
+            T_hp_sup = max(T_hp_sup, state_dict['T_hp_ret'])
         else:
             T_hp_sup = state_dict['T_hp_ret']
-
-        # Clip to HP operating limits
-        T_hp_sup = float(np.clip(T_hp_sup, self.hp_model.T_flow_min, self.hp_model.T_flow_max))
-        T_hp_sup = max(T_hp_sup, state_dict['T_hp_ret'])
         self.prev_action = T_hp_sup
 
         # Simulate one step
@@ -230,7 +228,6 @@ class RoomHeatEnv(gym.Env):
 
         self.t          += 1
         self._cur_steps += 1
-        self._total_steps += 1
         self.state       = self._build_obs(next_state)
 
         E_el_kWh  = costs['E_el'] / 1000.0
@@ -238,7 +235,8 @@ class RoomHeatEnv(gym.Env):
         cycle     = (hp_is_on != self._hp_was_on)   # state changed → cycle event
         self._hp_was_on = hp_is_on
         costs['T_room_last'] = next_state['T_room']  # pass T_room to reward fn
-        reward    = self._reward(E_el_kWh, pk['price_eur_kwh'], costs, cycle)
+        reward    = self._reward(E_el_kWh, pk['price_eur_kwh'], costs, cycle,
+                                  heating_cutoff_active)
 
         terminated = False
         truncated  = (
@@ -255,8 +253,12 @@ class RoomHeatEnv(gym.Env):
             'dev_neg_sum': float(costs['dev_neg_sum']),
             'T_room':      float(next_state['T_room']),
             'T_amb':       float(pk['T_amb']),
+            'Qdot_solar':    float(pk['Qdot_solar']),
+            'Qdot_internal': float(pk['Qdot_internal']),
+            'Qdot_gains':    float(pk['Qdot_gains']),
             'u':           float(T_hp_sup),
             'hp_on':       bool(hp_is_on),
+            'heating_cutoff_active': bool(heating_cutoff_active),
             't':           int(self.t),
         }
 
@@ -266,25 +268,6 @@ class RoomHeatEnv(gym.Env):
             obs  = obs.clip(self.observation_space.low, self.observation_space.high)
 
         return obs, float(reward), terminated, truncated, info
-
-    # ── Building construction helper ──────────────────────────────────────────
-
-    def _init_building(self, params: dict, mdot_hp: float):
-        """Instantiate Building and Simulator from a parameter dict.
-
-        Called once at startup and on every reset() when randomise_building=True.
-        """
-        self.bldg_model = Building(
-            params=params,
-            mdot_hp=mdot_hp,
-            T_room_set_lower=self.T_room_set_lower,
-            T_room_set_upper=self.T_room_set_upper,
-        )
-        self.simulator = Simulator(
-            hp_model=self.hp_model,
-            bldg_model=self.bldg_model,
-            timestep=self.delta_t,
-        )
 
     # internal 
 
@@ -302,9 +285,12 @@ class RoomHeatEnv(gym.Env):
         lo, hi = OBS_LIMITS['T_amb']
         low  += [lo] * self.forecast_steps
         high += [hi] * self.forecast_steps
-        # Building parameters (normalised to [0, 1])
-        low  += [0.0] * len(BLDG_PARAM_KEYS)
-        high += [1.0] * len(BLDG_PARAM_KEYS)
+        # Cyclical time features: sin/cos are always bounded in [-1, 1]
+        low  += [-1.0] * 4
+        high += [1.0] * 4
+        # Heating cutoff flag: 1.0 if T_amb >= T_amb_lim this step, else 0.0
+        low  += [0.0]
+        high += [1.0]
         return spaces.Box(
             low=np.array(low, dtype=np.float32),
             high=np.array(high, dtype=np.float32),
@@ -320,37 +306,54 @@ class RoomHeatEnv(gym.Env):
             obs.append(float(self.p.iloc[min(self.t + i, len(self.p) - 1)]['price_eur_kwh']))
         for i in range(1, self.forecast_steps + 1):
             obs.append(float(self.p.iloc[min(self.t + i, len(self.p) - 1)]['T_amb']))
-        # Building parameters — normalised to [0, 1]
-        p = self.bldg_model.params
-        for key in BLDG_PARAM_KEYS:
-            lo, hi = BLDG_PARAM_LIMITS[key]
-            val = float(p.get(key, lo))
-            obs.append(float(np.clip((val - lo) / (hi - lo), 0.0, 1.0)))
+        obs.extend(self._time_features(self.t))
+        obs.append(1.0 if pk['T_amb'] >= self.bldg_model.params['T_amb_lim'] else 0.0)
         return np.array(obs, dtype=np.float32)
 
-    def _reward(self, E_el_kWh: float, price: float, costs: Dict, cycle: bool) -> float:
+    def _time_features(self, t: int):
+        """Cyclical encoding of hour-of-day and day-of-year.
+
+        Requires no sensor or forecast -- the calendar is known with
+        certainty in both simulation and deployment
         """
-        r = comfort_weight * comfort - price * E_el_kWh - cycle_penalty
+        ts = self.p.index[min(t, len(self.p) - 1)]
+        hour_frac = ts.hour + ts.minute / 60.0
+        doy       = ts.dayofyear
+        days_in_year = 366.0 if ts.is_leap_year else 365.0
+        return (
+            np.sin(2 * np.pi * hour_frac / 24.0),
+            np.cos(2 * np.pi * hour_frac / 24.0),
+            np.sin(2 * np.pi * doy / days_in_year),
+            np.cos(2 * np.pi * doy / days_in_year),
+        )
 
-        comfort = -(T_room - 21)²   (parabola, peak 0 at 21 °C)
-
-        electricity_cost = price [€/kWh] * E_el_kWh
-
-        cycle_penalty = cycle_weight  if HP switched on↔off this step
+    def _reward(self, E_el_kWh: float, price: float, costs: Dict, cycle: bool,
+                heating_cutoff_active: bool) -> float:
         """
-        T_room = costs.get('T_room_last', 21.0)
-        scale  = 1 / 1000
+        Three-tier priority reward: comfort >> cost >> cycling.
+        """
+        T_room = costs.get('T_room_last', 21.0)   # fallback; set below in step()
+        T_low, T_high = self.T_room_set_lower, self.T_room_set_upper
+        T_center = (T_low + T_high) / 2.0
+        half_width = (T_high - T_low) / 2.0
+        scale = 1 / 500
 
-        # Comfort term: parabola with peak at 21°C
-        comfort = -((T_room - 21.0) ** 2)
+        if heating_cutoff_active:
+            comfort_penalty = 0.0
+        elif T_room < T_low:
+            comfort_penalty = min((T_low - T_room) ** 2, self.comfort_penalty_cap)
+        elif T_room > T_high:
+            comfort_penalty = min((T_room - T_high) ** 2, self.comfort_penalty_cap)
+        else:
+            comfort_penalty = self.comfort_inband_weight * ((T_room - T_center) / half_width) ** 2
 
-        # Electricity cost penalty
-        cost_penalty = price * E_el_kWh
+        cost_penalty  = price * E_el_kWh
+        cycle_penalty = 1.0 if cycle else 0.0
 
-        # Cycle penalty
-        cycle_penalty = self.cycle_weight if cycle else 0.0
-
-        return scale * float(self.comfort_weight * comfort - cost_penalty - cycle_penalty)
+        total = (self.comfort_weight * comfort_penalty
+                 + self.cost_weight   * cost_penalty
+                 + self.cycle_weight  * cycle_penalty)
+        return -scale * float(total)
 
     def _get_pk(self, t: int) -> Dict:
         return self.p.iloc[min(t, len(self.p) - 1)].to_dict()
