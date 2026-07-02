@@ -21,8 +21,9 @@ import matplotlib.pyplot as plt
 from matplotlib.dates import DateFormatter
 
 from stable_baselines3 import SAC
-from stable_baselines3.common.vec_env import DummyVecEnv, VecNormalize
 from src.room_env import RoomHeatEnv
+from src.gains import build_gains_series, DEFAULT_PROFILES_DIR
+from models.vonovia_model import vonovia_model
 
 
 # ── Argument parser ───────────────────────────────────────────────────────────
@@ -39,50 +40,58 @@ def get_args():
                    help='Path to save the plot (e.g. eval.png). Shows interactively if not set.')
     p.add_argument('--T_comfort_low',  type=float, default=20.0)
     p.add_argument('--T_comfort_high', type=float, default=22.0)
-    p.add_argument('--seed',     type=int, default=None,
-                   help='Seed for the episode start point (random_init). '
-                        'Use the same seed across models for an apples-to-apples '
-                        'comparison. Omit for a random start each run.')
-    p.add_argument('--vecnormalize', type=str, default=None,
-                   help='Path to saved VecNormalize stats (.pkl), e.g. '
-                        'runs/<run_name>/vecnormalize.pkl. REQUIRED if the model '
-                        'was trained with --normalize_obs (the default) -- without '
-                        'this, the model receives raw, unnormalized observations '
-                        'completely different from what it was trained on, which '
-                        'silently produces nonsense actions rather than an error.')
+    p.add_argument('--profiles_dir', type=str, default=DEFAULT_PROFILES_DIR,
+                   help='Folder with solar_*.csv file(s) + internal_gains.csv.')
+    p.add_argument('--no_gains',   action='store_true',
+                   help='Disable solar/internal gains (Qdot_gains=0).')
     return p.parse_args()
 
 
 # ── Data ──────────────────────────────────────────────────────────────────────
 
-def load_or_generate(path, days):
+def load_or_generate(path, days, profiles_dir=None, no_gains=False):
     if path is not None:
         df = pd.read_csv(path, index_col='timestamp', parse_dates=True)
         df = df[~df.index.duplicated(keep='first')]  
         print(f"Loaded {path}: {len(df):,} hours")
-        return df
+    else:
+        n  = days * 24 + 48   # a bit extra for forecast lookahead
+        idx = pd.date_range('2024-01-01', periods=n, freq='h', tz='Europe/Berlin')
+        t   = np.arange(n)
+        print("Using synthetic data")
+        df = pd.DataFrame({
+            'T_amb':         2 - 8*np.cos(2*np.pi*t/(24*365)) - 4*np.cos(2*np.pi*t/24),
+            'price_eur_kwh': 0.22 + 0.12*np.sin(2*np.pi*t/24) + 0.03*np.random.randn(n),
+        }, index=idx)
 
-    n  = days * 24 + 48   # a bit extra for forecast lookahead
-    idx = pd.date_range('2024-01-01', periods=n, freq='h', tz='Europe/Berlin')
-    t   = np.arange(n)
-    print("Using synthetic data")
-    return pd.DataFrame({
-        'T_amb':         2 - 8*np.cos(2*np.pi*t/(24*365)) - 4*np.cos(2*np.pi*t/24),
-        'price_eur_kwh': 0.22 + 0.12*np.sin(2*np.pi*t/24) + 0.03*np.random.randn(n),
-    }, index=idx)
+    if no_gains:
+        print("--no_gains set: Qdot_gains=0 (solar/internal gains disabled)")
+    else:
+        try:
+            gains_df = build_gains_series(
+                df.index, profiles_dir=profiles_dir,
+                area_floor=vonovia_model['area_floor'])
+            df['Qdot_gains'] = gains_df['Qdot_gains']
+            df['Q_sol_W']    = gains_df['Q_sol_W']
+            print(f"Gains merged from {profiles_dir}: "
+                  f"mean {gains_df['Qdot_gains'].mean():.0f} W, "
+                  f"max {gains_df['Qdot_gains'].max():.0f} W")
+        except FileNotFoundError as e:
+            print(f"WARNING: could not load gains ({e}); falling back to "
+                  f"Qdot_gains=0.")
+    return df
 
 
 # ── Run episode ───────────────────────────────────────────────────────────────
 
-def run_episode(model, env, seed=None, vecnorm=None):
+def run_episode(model, env):
     """Run one full episode and collect all relevant signals."""
     records = []
-    obs, _ = env.reset(seed=seed)
+    obs, _ = env.reset()
     done   = False
 
     while not done:
-        model_input = vecnorm.normalize_obs(obs) if vecnorm is not None else obs
-        action, _ = model.predict(model_input, deterministic=True)
+        action, _ = model.predict(obs, deterministic=True)
         obs, reward, terminated, truncated, info = env.step(action)
         done = terminated or truncated
         records.append({
@@ -91,9 +100,11 @@ def run_episode(model, env, seed=None, vecnorm=None):
             'T_amb':     info['T_amb'],
             'u':         info['u'],              # T_hp_sup actually applied
             'hp_on':     info['hp_on'],          # compressor on/off (modulation floor)
-            'cutoff':    info['heating_cutoff_active'],  # forced HP-off (T_amb >= T_amb_lim)
             'price':     info['price'],
             'E_el_kWh':  info['E_el_kWh'],
+            'P_el_kW':   info['P_el_kW'],        # electrical power drawn this step
+            'Qdot_th_kW': info['Qdot_th_kW'],    # thermal power delivered to the building
+            'Qdot_gains_kW': info['Qdot_gains_kW'],  # solar+internal gains this step
             'dev_neg':   info['dev_neg_max'],
             'reward':    reward,
         })
@@ -104,7 +115,7 @@ def run_episode(model, env, seed=None, vecnorm=None):
 # ── Plot ──────────────────────────────────────────────────────────────────────
 
 def plot_results(df, T_low, T_high, save_path=None):
-    fig, axes = plt.subplots(4, 1, figsize=(14, 13), sharex=True)
+    fig, axes = plt.subplots(3, 1, figsize=(14, 10), sharex=True)
     fig.patch.set_facecolor('#0f1117')
     for ax in axes:
         ax.set_facecolor('#161b22')
@@ -141,55 +152,56 @@ def plot_results(df, T_low, T_high, save_path=None):
                          where=viol_high, alpha=0.3, color='#d29922',
                          label='Over-heating')
 
-    # ── Panel 2: HP electrical power, with heating-cutoff periods shaded ─────
-    # Shows directly whether T_room rising during cutoff is passive (power=0)
-    # or the agent actually spending electricity -- settles the question
-    # visually instead of inferring it from the supply-temperature trace.
+    # ── Panel 2: Supply temperature + electrical power ────────────────────────
     ax2 = axes[1]
-    if df['cutoff'].any():
-        ax2.fill_between(t, 0, 1, where=df['cutoff'], transform=ax2.get_yaxis_transform(),
-                         alpha=0.12, color='#d29922', step='post',
-                         label='Heating cutoff active (HP forced off)')
-    ax2.fill_between(t, 0, df['E_el_kWh'], step='post', alpha=0.5, color='#3fb950')
-    ax2.plot(t, df['E_el_kWh'], color='#3fb950', linewidth=1.0, drawstyle='steps-post',
-              label='HP electrical power')
-    ax2.set_ylabel('Power [kW]')
-    ax2.set_title('HP Electrical Power Draw', color='#e6edf3', fontsize=11, pad=8)
-    ax2.legend(loc='upper right', framealpha=0.3,
-               labelcolor='#e6edf3', facecolor='#161b22', edgecolor='#30363d')
+    l1, = ax2.plot(t, df['u'], color='#ff7b72', linewidth=1.5, label='T_hp_sup (applied)')
+    ax2.set_ylabel('Supply Temp [°C]', color='#ff7b72')
+    ax2.tick_params(axis='y', colors='#ff7b72')
+    ax2.set_title('HP Supply Temperature & Electrical Power', color='#e6edf3',
+                  fontsize=11, pad=8)
     ax2.grid(axis='y', color='#30363d', linewidth=0.5)
 
-    # ── Panel 3: Supply temperature ───────────────────────────────────────────
+    ax2b = ax2.twinx()
+    ax2b.set_facecolor('#161b22')
+    ax2b.tick_params(colors='#8b949e')
+    ax2b.spines[:].set_color('#30363d')
+    l2, = ax2b.plot(t, df['P_el_kW'], color='#79c0ff', linewidth=1.3,
+                     alpha=0.9, label='P_el (electrical power)')
+    ax2b.fill_between(t, 0, df['P_el_kW'], color='#79c0ff', alpha=0.10)
+    ax2b.set_ylabel('Electrical Power [kW]', color='#79c0ff')
+    ax2b.tick_params(axis='y', colors='#79c0ff')
+    ax2b.set_ylim(bottom=0)
+
+    ax2.legend(handles=[l1, l2], loc='upper right', framealpha=0.3,
+               labelcolor='#e6edf3', facecolor='#161b22', edgecolor='#30363d')
+
+    # ── Panel 3: Ambient temperature ──────────────────────────────────────────
     ax3 = axes[2]
-    ax3.plot(t, df['u'], color='#ff7b72', linewidth=1.5, label='T_hp_sup (applied)')
-    ax3.set_ylabel('Supply Temp [°C]')
-    ax3.set_title('HP Supply Temperature', color='#e6edf3', fontsize=11, pad=8)
+    ax3.plot(t, df['T_amb'], color='#d2a8ff', linewidth=1.5, label='T_amb')
+    ax3.axhline(0, color='#8b949e', linewidth=0.6, linestyle=':')
+    ax3.set_ylabel('Ambient Temp [°C]')
+    ax3.set_xlabel('Time')
+    ax3.set_title('Outdoor Ambient Temperature', color='#e6edf3', fontsize=11, pad=8)
     ax3.legend(loc='upper right', framealpha=0.3,
                labelcolor='#e6edf3', facecolor='#161b22', edgecolor='#30363d')
     ax3.grid(axis='y', color='#30363d', linewidth=0.5)
-
-    # ── Panel 4: Ambient temperature ──────────────────────────────────────────
-    ax4 = axes[3]
-    ax4.plot(t, df['T_amb'], color='#d2a8ff', linewidth=1.5, label='T_amb')
-    ax4.axhline(0, color='#8b949e', linewidth=0.6, linestyle=':')
-    ax4.set_ylabel('Ambient Temp [°C]')
-    ax4.set_xlabel('Time')
-    ax4.set_title('Outdoor Ambient Temperature', color='#e6edf3', fontsize=11, pad=8)
-    ax4.legend(loc='upper right', framealpha=0.3,
-               labelcolor='#e6edf3', facecolor='#161b22', edgecolor='#30363d')
-    ax4.grid(axis='y', color='#30363d', linewidth=0.5)
-    ax4.xaxis.set_major_formatter(DateFormatter('%d %b'))
+    ax3.xaxis.set_major_formatter(DateFormatter('%d %b'))
 
     # ── Summary stats ─────────────────────────────────────────────────────────
     total_cost   = (df['price'] * df['E_el_kWh']).sum()
     total_energy = df['E_el_kWh'].sum()
+    total_thermal_kWh = df['Qdot_th_kW'].sum()   # hourly steps -> kWh == kW summed
+    total_gains_kWh   = df['Qdot_gains_kW'].sum() if 'Qdot_gains_kW' in df.columns else 0.0
+    total_combined_kWh = total_thermal_kWh + total_gains_kWh
+    n_hours      = len(df)
+    annualized_thermal_kWh  = total_thermal_kWh / n_hours * 8760.0
+    annualized_gains_kWh    = total_gains_kWh / n_hours * 8760.0
+    annualized_combined_kWh = total_combined_kWh / n_hours * 8760.0
     viol_low     = df['T_room'] < T_low
     viol_high    = df['T_room'] > T_high
     pct_comfort  = 100 * (1 - (viol_low | viol_high).mean())
     pct_under    = 100 * viol_low.mean()
     pct_over     = 100 * viol_high.mean()
-    pct_cutoff   = 100 * df['cutoff'].mean()
-    power_during_cutoff = df.loc[df['cutoff'], 'E_el_kWh'].sum() if df['cutoff'].any() else 0.0
 
     # Count off→on transitions (rising edges) — each one is exactly one
     # compressor start-up. This avoids the parity problem of counting
@@ -202,10 +214,10 @@ def plot_results(df, T_low, T_high, save_path=None):
 
     stats = (f"Energy: {total_energy:.1f} kWh  |  "
              f"Cost: €{total_cost:.2f}  |  "
+             f"HP+gains: {total_combined_kWh:.0f} kWh (~{annualized_combined_kWh:,.0f} kWh/a)  |  "
              f"Comfort: {pct_comfort:.1f}% (under: {pct_under:.1f}%, over: {pct_over:.1f}%)  |  "
-             f"HP cycles: {n_cycles}  |  "
-             f"Cutoff: {pct_cutoff:.1f}% of hours (power drawn during cutoff: {power_during_cutoff:.4f} kWh)")
-    fig.text(0.5, 0.01, stats, ha='center', color='#8b949e', fontsize=8)
+             f"HP cycles: {n_cycles}")
+    fig.text(0.5, 0.01, stats, ha='center', color='#8b949e', fontsize=9)
 
     plt.tight_layout(rect=[0, 0.03, 1, 1])
     plt.subplots_adjust(hspace=0.35)
@@ -218,14 +230,18 @@ def plot_results(df, T_low, T_high, save_path=None):
         plt.show()
 
     return {
-        'total_energy_kWh': total_energy,
-        'total_cost_eur':   total_cost,
-        'pct_comfort':      pct_comfort,
-        'pct_under':        pct_under,
-        'pct_over':         pct_over,
-        'pct_cutoff':       pct_cutoff,
-        'power_during_cutoff': power_during_cutoff,
-        'n_cycles':         n_cycles,
+        'total_energy_kWh':  total_energy,
+        'total_cost_eur':    total_cost,
+        'total_thermal_kWh': total_thermal_kWh,
+        'total_gains_kWh':   total_gains_kWh,
+        'total_combined_kWh': total_combined_kWh,
+        'annualized_thermal_kWh':  annualized_thermal_kWh,
+        'annualized_gains_kWh':    annualized_gains_kWh,
+        'annualized_combined_kWh': annualized_combined_kWh,
+        'pct_comfort':       pct_comfort,
+        'pct_under':         pct_under,
+        'pct_over':          pct_over,
+        'n_cycles':          n_cycles,
     }
 
 
@@ -235,13 +251,13 @@ def main():
     args = get_args()
 
     # Data
-    data = load_or_generate(args.data, args.days)
+    data = load_or_generate(args.data, args.days, args.profiles_dir, args.no_gains)
 
     # Environment
     env = RoomHeatEnv(
         disturbances=data,
         days=args.days,
-        random_init=True,
+        random_init=False,
         forecast_steps=24,
     )
 
@@ -250,17 +266,9 @@ def main():
     model_path = args.model.replace('.zip', '')
     model = SAC.load(model_path, env=env)
 
-    # VecNormalize (required if the model was trained with --normalize_obs)
-    vecnorm = None
-    if args.vecnormalize:
-        dummy_venv = DummyVecEnv([lambda: env])
-        vecnorm = VecNormalize.load(args.vecnormalize, dummy_venv)
-        vecnorm.training = False   # freeze stats -- do not update from eval rollouts
-        print(f"  VecNormalize loaded from {args.vecnormalize} (stats frozen)")
-
     # Run
-    print(f"Running {args.days}-day episode... (seed={args.seed if args.seed is not None else 'random'})")
-    df = run_episode(model, env, seed=args.seed, vecnorm=vecnorm)
+    print(f"Running {args.days}-day episode...")
+    df = run_episode(model, env)
 
     # Summary
     print(f"\n── Results ──────────────────────────────")
@@ -273,12 +281,16 @@ def main():
     stats = plot_results(df, args.T_comfort_low, args.T_comfort_high, args.save)
     print(f"  Total energy  : {stats['total_energy_kWh']:.1f} kWh")
     print(f"  Total cost    : €{stats['total_cost_eur']:.2f}")
+    print(f"  HP delivered  : {stats['total_thermal_kWh']:.1f} kWh "
+          f"(~{stats['annualized_thermal_kWh']:,.0f} kWh/a) -- depends on policy quality")
+    print(f"  Gains (solar+internal): {stats['total_gains_kWh']:.1f} kWh "
+          f"(~{stats['annualized_gains_kWh']:,.0f} kWh/a) -- policy-independent")
+    print(f"  HP + gains    : {stats['total_combined_kWh']:.1f} kWh "
+          f"(~{stats['annualized_combined_kWh']:,.0f} kWh/a) --  "
+          f" documented annual heating demand: 30,828 kWh/a")
     print(f"  Comfort %     : {stats['pct_comfort']:.1f}%  "
           f"(under: {stats['pct_under']:.1f}%, over: {stats['pct_over']:.1f}%)")
     print(f"  HP cycles     : {stats['n_cycles']}")
-    print(f"  Cutoff active : {stats['pct_cutoff']:.1f}% of hours  |  "
-          f"power drawn during cutoff: {stats['power_during_cutoff']:.4f} kWh "
-          f"(should be exactly 0 -- nonzero would indicate a bug)")
 
 
 if __name__ == '__main__':

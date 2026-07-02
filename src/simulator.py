@@ -1,6 +1,9 @@
 import numpy as np
 from scipy.integrate import solve_ivp
 
+# numpy >=2.0 renamed trapz -> trapezoid; keep working on both
+_trapz = getattr(np, 'trapezoid', None) or np.trapz
+
 
 class Simulator:
     """One-step building + heat pump simulator.
@@ -48,8 +51,15 @@ class Simulator:
         # Build initial state array in the order the ODE expects
         x_init_np = np.array([x_init[key] for key in state_keys])
 
+        # Real compressor capacity ceiling at this operating point [W].
+        # This is what actually constrains how fast T_hp_ret can rise in
+        # the ODE -- see Building.calc(). Without it, the simulator models
+        # an idealized infinite-capacity heat source (see simulator notes).
+        Qdot_hp_max_W = self.hp_model.get_max_heating_capacity(
+            T_amb=pk['T_amb'], T_flow=uk) * 1000.0
+
         # Build input list: T_hp_sup first, then disturbances
-        input_dict   = {'T_hp_sup': uk, **pk}
+        input_dict   = {'T_hp_sup': uk, 'Qdot_hp_max': Qdot_hp_max_W, **pk}
         input_values = [input_dict[key] for key in input_keys]
 
         # Integrate ODE over one timestep
@@ -71,8 +81,11 @@ class Simulator:
         # Final state only — becomes next x_init
         next_state = {key: float(ode_result.y[i, -1]) for i, key in enumerate(state_keys)}
 
-        # Compute costs using intermediate states (not just final)
-        cost = self._calc_cost(state_dict=state_dict, input_dict=input_dict)
+        # Compute costs using intermediate states (not just final), passing
+        # the solver's actual (non-uniform) time points for proper
+        # time-weighted averaging instead of a flat per-sample mean.
+        cost = self._calc_cost(
+            state_dict=state_dict, input_dict=input_dict, t=ode_result.t)
 
         return {
             'state':      next_state,
@@ -83,7 +96,7 @@ class Simulator:
 
     # ── Cost calculation ──────────────────────────────────────────────────────
 
-    def _calc_cost(self, state_dict, input_dict):
+    def _calc_cost(self, state_dict, input_dict, t=None):
         """Compute HP energy cost and building comfort deviation.
 
         Uses all intermediate solve_ivp states (like i4b) for accuracy.
@@ -93,7 +106,11 @@ class Simulator:
         state_dict : dict
             Arrays of intermediate states from solve_ivp.
         input_dict : dict
-            {'T_hp_sup': ..., 'T_amb': ..., 'Qdot_gains': ...}
+            {'T_hp_sup': ..., 'T_amb': ..., 'Qdot_gains': ..., 'Qdot_hp_max': ...}
+        t : array-like, optional
+            The solver's actual (non-uniform) time points, for proper
+            time-weighted (trapezoidal) averaging instead of a flat mean
+            over solver steps -- see notes in calc_comfort_dev.
 
         Returns
         -------
@@ -102,17 +119,29 @@ class Simulator:
         T_hp_ret_trace = state_dict['T_hp_ret']
         T_room_trace   = state_dict['T_room']
 
-        T_hp_sup = input_dict['T_hp_sup']
-        T_amb    = input_dict['T_amb']
+        T_hp_sup    = input_dict['T_hp_sup']
+        T_amb       = input_dict['T_amb']
+        Qdot_hp_max = input_dict['Qdot_hp_max']   # W, real compressor ceiling
 
         # ── HP energy cost ────────────────────────────────────────────────────
         COP = self.hp_model.compute_COP(T_amb=T_amb, T_flow=T_hp_sup)
 
-        # Average thermal output over all intermediate steps (mirrors i4b)
-        Qdot_th = float(np.mean(
-            self.bldg_model.mdot_hp * 4181.0 * (T_hp_sup - T_hp_ret_trace)
-        ))
-        Qdot_th = max(Qdot_th, 0.0)   # can't be negative
+        # Heat actually injected at each intermediate point, capped at the
+        # real compressor ceiling -- mirrors the same cap enforced inside
+        # the ODE itself (Building.calc), so the reported energy use stays
+        # consistent with what was physically delivered into the building.
+        Qdot_th_trace = np.clip(
+            self.bldg_model.mdot_hp * 4181.0 * (T_hp_sup - T_hp_ret_trace),
+            0.0, Qdot_hp_max,
+        )
+
+        # Time-weighted average over the solver's actual (non-uniform) steps,
+        # not a flat per-sample mean which would over-weight whatever phase
+        # of the transient the adaptive solver happened to sample densely.
+        if t is not None and len(t) > 1:
+            Qdot_th = float(_trapz(Qdot_th_trace, t) / (t[-1] - t[0]))
+        else:
+            Qdot_th = float(np.mean(Qdot_th_trace))
 
         # ── Modulation floor (datasheet: ALM 4-12 min stable output ~4 kW) ────
         # The inverter compressor cannot sustain output between 0 and 4 kW.
@@ -140,6 +169,7 @@ class Simulator:
         cost_bldg = self.bldg_model.calc_comfort_dev(
             T_room   = T_room_trace,
             timestep = self.timestep,
+            t        = t,
         )
 
         return {**cost_hp, **cost_bldg}
