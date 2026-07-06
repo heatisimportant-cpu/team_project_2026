@@ -34,10 +34,11 @@ def get_args():
                    help='Path to saved model (.zip)')
     p.add_argument('--data',     type=str, default=None,
                    help='CSV with T_amb and price_eur_kwh. Synthetic if not provided.')
-    p.add_argument('--days',     type=int, default=14,
-                   help='Number of days to evaluate.')
+    p.add_argument('--days',     type=int, default=212,
+                   help='Episode length in days. Default 212 = one full Oct–Apr heating period.')
     p.add_argument('--save',     type=str, default=None,
-                   help='Path to save the plot (e.g. eval.png). Shows interactively if not set.')
+                   help='Base path to save outputs (no extension). '
+                        'Saves <save>.png and <save>_monthly.csv.')
     p.add_argument('--T_comfort_low',  type=float, default=20.0)
     p.add_argument('--T_comfort_high', type=float, default=22.0)
     p.add_argument('--profiles_dir', type=str, default=DEFAULT_PROFILES_DIR,
@@ -188,33 +189,36 @@ def plot_results(df, T_low, T_high, save_path=None):
     ax3.xaxis.set_major_formatter(DateFormatter('%d %b'))
 
     # ── Summary stats ─────────────────────────────────────────────────────────
-    total_cost   = (df['price'] * df['E_el_kWh']).sum()
-    total_energy = df['E_el_kWh'].sum()
-    total_thermal_kWh = df['Qdot_th_kW'].sum()   # hourly steps -> kWh == kW summed
-    total_gains_kWh   = df['Qdot_gains_kW'].sum() if 'Qdot_gains_kW' in df.columns else 0.0
+    total_cost         = (df['price'] * df['E_el_kWh']).sum()
+    total_energy       = df['E_el_kWh'].sum()
+    total_thermal_kWh  = df['Qdot_th_kW'].sum()
+    total_gains_kWh    = df['Qdot_gains_kW'].sum() if 'Qdot_gains_kW' in df.columns else 0.0
     total_combined_kWh = total_thermal_kWh + total_gains_kWh
-    n_hours      = len(df)
-    annualized_thermal_kWh  = total_thermal_kWh / n_hours * 8760.0
-    annualized_gains_kWh    = total_gains_kWh / n_hours * 8760.0
-    annualized_combined_kWh = total_combined_kWh / n_hours * 8760.0
-    viol_low     = df['T_room'] < T_low
-    viol_high    = df['T_room'] > T_high
-    pct_comfort  = 100 * (1 - (viol_low | viol_high).mean())
-    pct_under    = 100 * viol_low.mean()
-    pct_over     = 100 * viol_high.mean()
+    n_hours            = len(df)
+    n_days             = n_hours / 24.0
 
-    # Count off→on transitions (rising edges) — each one is exactly one
-    # compressor start-up. This avoids the parity problem of counting
-    # all transitions and dividing by 2, which undercounts whenever the
-    # episode starts already "on" or ends while still "on".
+    viol_low    = df['T_room'] < T_low
+    viol_high   = df['T_room'] > T_high
+    pct_comfort = 100 * (1 - (viol_low | viol_high).mean())
+    pct_under   = 100 * viol_low.mean()
+    pct_over    = 100 * viol_high.mean()
+
+    T = df['T_room']
+    T_mean      = float(T.mean())
+    T_median    = float(T.median())
+    T_std       = float(T.std())
+    dev_mean    = float((T - 21.0).abs().mean())   # mean absolute deviation from 21°C setpoint
+    hours_cold  = int(viol_low.sum())              # hours below 20°C
+    hours_hot   = int(viol_high.sum())             # hours above 22°C
+
     hp_on_int = df['hp_on'].astype(int)
     n_cycles  = int((hp_on_int.diff() == 1).sum())
     if hp_on_int.iloc[0] == 1:
-        n_cycles += 1   # compressor was already on at the first recorded step
+        n_cycles += 1
 
     stats = (f"Energy: {total_energy:.1f} kWh  |  "
              f"Cost: €{total_cost:.2f}  |  "
-             f"HP+gains: {total_combined_kWh:.0f} kWh (~{annualized_combined_kWh:,.0f} kWh/a)  |  "
+             f"HP+gains: {total_combined_kWh:.0f} kWh over {n_days:.0f} days  |  "
              f"Comfort: {pct_comfort:.1f}% (under: {pct_under:.1f}%, over: {pct_over:.1f}%)  |  "
              f"HP cycles: {n_cycles}")
     fig.text(0.5, 0.01, stats, ha='center', color='#8b949e', fontsize=9)
@@ -230,19 +234,44 @@ def plot_results(df, T_low, T_high, save_path=None):
         plt.show()
 
     return {
-        'total_energy_kWh':  total_energy,
-        'total_cost_eur':    total_cost,
-        'total_thermal_kWh': total_thermal_kWh,
-        'total_gains_kWh':   total_gains_kWh,
-        'total_combined_kWh': total_combined_kWh,
-        'annualized_thermal_kWh':  annualized_thermal_kWh,
-        'annualized_gains_kWh':    annualized_gains_kWh,
-        'annualized_combined_kWh': annualized_combined_kWh,
-        'pct_comfort':       pct_comfort,
-        'pct_under':         pct_under,
-        'pct_over':          pct_over,
-        'n_cycles':          n_cycles,
+        'total_energy_kWh':    total_energy,
+        'total_cost_eur':      total_cost,
+        'total_thermal_kWh':   total_thermal_kWh,
+        'total_gains_kWh':     total_gains_kWh,
+        'total_combined_kWh':  total_combined_kWh,
+        'n_days':              n_days,
+        'T_mean':              round(T_mean, 2),
+        'T_median':            round(T_median, 2),
+        'T_std':               round(T_std, 3),
+        'dev_from_setpoint':   round(dev_mean, 3),
+        'hours_too_cold':      hours_cold,
+        'hours_too_hot':       hours_hot,
+        'pct_comfort':         pct_comfort,
+        'pct_under':           pct_under,
+        'pct_over':            pct_over,
+        'n_cycles':            n_cycles,
     }
+
+
+def monthly_breakdown(df, T_low, T_high):
+    """Return a per-month comfort/energy summary DataFrame."""
+    return df.resample('ME').apply(lambda x: pd.Series({
+        'comfort%':      round(100 * x['T_room'].between(T_low, T_high).mean(), 1),
+        'under%':        round(100 * (x['T_room'] < T_low).mean(), 1),
+        'over%':         round(100 * (x['T_room'] > T_high).mean(), 1),
+        'T_mean':        round(x['T_room'].mean(), 2),
+        'T_median':      round(x['T_room'].median(), 2),
+        'T_std':         round(x['T_room'].std(), 2),
+        'dev_setpoint':  round((x['T_room'] - 21.0).abs().mean(), 2),
+        'h_too_cold':    int((x['T_room'] < T_low).sum()),
+        'h_too_hot':     int((x['T_room'] > T_high).sum()),
+        'T_max':         round(x['T_room'].max(), 1),
+        'T_min':         round(x['T_room'].min(), 1),
+        'cycles':        int((pd.Series(x['hp_on'].astype(int)).diff() == 1).sum()),
+        'HP_kWh':        round(x['Qdot_th_kW'].sum(), 1),
+        'elec_kWh':      round(x['E_el_kWh'].sum(), 1),
+        'cost_eur':      round((x['price'] * x['E_el_kWh']).sum(), 2),
+    }))
 
 
 # ── Main ──────────────────────────────────────────────────────────────────────
@@ -253,7 +282,9 @@ def main():
     # Data
     data = load_or_generate(args.data, args.days, args.profiles_dir, args.no_gains)
 
-    # Environment
+    # Environment — random_init=False for deterministic post-training evaluation.
+    # (random_init=True is for training's EvalCallback which benefits from varied
+    #  start conditions; here we want a reproducible fixed-start episode.)
     env = RoomHeatEnv(
         disturbances=data,
         days=args.days,
@@ -270,27 +301,45 @@ def main():
     print(f"Running {args.days}-day episode...")
     df = run_episode(model, env)
 
-    # Summary
-    print(f"\n── Results ──────────────────────────────")
-    print(f"  Steps         : {len(df)}")
+    # ── Console summary ───────────────────────────────────────────────────────
+    print(f"\n── Results ──────────────────────────────────────────────────────")
+    print(f"  Period        : {df.index[0].date()} → {df.index[-1].date()}  "
+          f"({len(df)} steps / {len(df)/24:.0f} days)")
     print(f"  T_room range  : {df['T_room'].min():.1f} – {df['T_room'].max():.1f} °C")
     print(f"  T_amb range   : {df['T_amb'].min():.1f} – {df['T_amb'].max():.1f} °C")
     print(f"  T_sup range   : {df['u'].min():.1f} – {df['u'].max():.1f} °C")
 
-    # Plot
-    stats = plot_results(df, args.T_comfort_low, args.T_comfort_high, args.save)
-    print(f"  Total energy  : {stats['total_energy_kWh']:.1f} kWh")
-    print(f"  Total cost    : €{stats['total_cost_eur']:.2f}")
-    print(f"  HP delivered  : {stats['total_thermal_kWh']:.1f} kWh "
-          f"(~{stats['annualized_thermal_kWh']:,.0f} kWh/a) -- depends on policy quality")
-    print(f"  Gains (solar+internal): {stats['total_gains_kWh']:.1f} kWh "
-          f"(~{stats['annualized_gains_kWh']:,.0f} kWh/a) -- policy-independent")
-    print(f"  HP + gains    : {stats['total_combined_kWh']:.1f} kWh "
-          f"(~{stats['annualized_combined_kWh']:,.0f} kWh/a) --  "
-          f" documented annual heating demand: 30,828 kWh/a")
-    print(f"  Comfort %     : {stats['pct_comfort']:.1f}%  "
-          f"(under: {stats['pct_under']:.1f}%, over: {stats['pct_over']:.1f}%)")
+    stats = plot_results(df, args.T_comfort_low, args.T_comfort_high,
+                         save_path=f'{args.save}.png' if args.save else None)
+
+    print(f"\n── Room temperature ─────────────────────────────────────────────")
+    print(f"  Mean          : {stats['T_mean']:.2f} °C  (setpoint: 21.0 °C)")
+    print(f"  Median        : {stats['T_median']:.2f} °C")
+    print(f"  Std deviation : {stats['T_std']:.2f} °C")
+    print(f"  Mean |dev| from 21°C setpoint : {stats['dev_from_setpoint']:.2f} K")
+    print(f"  Hours too cold (<{args.T_comfort_low:.0f}°C) : "
+          f"{stats['hours_too_cold']:,} h  ({stats['pct_under']:.1f}%)")
+    print(f"  Hours too hot  (>{args.T_comfort_high:.0f}°C) : "
+          f"{stats['hours_too_hot']:,} h  ({stats['pct_over']:.1f}%)")
+    print(f"  Comfort %     : {stats['pct_comfort']:.1f}%")
+
+    print(f"\n── Energy & cost ────────────────────────────────────────────────")
+    print(f"  Electricity   : {stats['total_energy_kWh']:.1f} kWh")
+    print(f"  Cost          : €{stats['total_cost_eur']:.2f}")
+    print(f"  HP delivered  : {stats['total_thermal_kWh']:.1f} kWh")
+    print(f"  Gains         : {stats['total_gains_kWh']:.1f} kWh  (solar + internal)")
+    print(f"  HP + gains    : {stats['total_combined_kWh']:.1f} kWh")
     print(f"  HP cycles     : {stats['n_cycles']}")
+
+    # ── Monthly breakdown ─────────────────────────────────────────────────────
+    monthly = monthly_breakdown(df, args.T_comfort_low, args.T_comfort_high)
+    print(f"\n── Monthly breakdown ────────────────────────────────────────────")
+    print(monthly.to_string())
+
+    if args.save:
+        csv_path = f'{args.save}_monthly.csv'
+        monthly.to_csv(csv_path)
+        print(f"\nMonthly breakdown saved → {csv_path}")
 
 
 if __name__ == '__main__':

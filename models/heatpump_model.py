@@ -1,26 +1,8 @@
-"""
-Heat Pump Model - iDM AERO ALM 4-12
-=====================================
-Built directly from the official EN14511 "Leistungsdaten Heizen" table
-(IDM193401bis403_ma_de_812199_AERO-ALM-2-15-2.0-Datenbl.pdf, p.14,
-section 2.8 "AERO ALM 4-12 - Leistungsdaten Heizen", MAX-speed curve).
-"""
 import numpy as np
 from scipy.interpolate import RegularGridInterpolator
 
 
 class iDM_AERO_ALM_4_12:
-    """
-    iDM AERO ALM 4-12 air-source heat pump model.
-
-    COP(T_amb, T_flow) obtained via bilinear interpolation of the real
-    EN14511 MAX-speed datasheet table (heating capacity / electrical
-    input), not a fitted formula.
-    """
-
-    # ── Real datasheet grid (MAX speed, EN14511, p.14) ───────────────────
-    # Tamb ascending; missing (None) cells are at the edge of the
-    # operating envelope for that flow temp (compressor cannot reach it)
     _TAMB = np.array([-20, -15, -10, -7, 2, 7, 10, 12, 15, 20], dtype=float)
     _TFLOW = np.array([35, 45, 50, 55, 60, 70], dtype=float)
 

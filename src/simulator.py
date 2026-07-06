@@ -1,8 +1,7 @@
 import numpy as np
 from scipy.integrate import solve_ivp
 
-# numpy >=2.0 renamed trapz -> trapezoid; keep working on both
-_trapz = getattr(np, 'trapezoid', None) or np.trapz
+_trapz = getattr(np, 'trapezoid', None) 
 
 
 class Simulator:
@@ -126,26 +125,18 @@ class Simulator:
         # ── HP energy cost ────────────────────────────────────────────────────
         COP = self.hp_model.compute_COP(T_amb=T_amb, T_flow=T_hp_sup)
 
-        # Heat actually injected at each intermediate point, capped at the
-        # real compressor ceiling -- mirrors the same cap enforced inside
-        # the ODE itself (Building.calc), so the reported energy use stays
-        # consistent with what was physically delivered into the building.
         Qdot_th_trace = np.clip(
             self.bldg_model.mdot_hp * 4181.0 * (T_hp_sup - T_hp_ret_trace),
             0.0, Qdot_hp_max,
         )
 
-        # Time-weighted average over the solver's actual (non-uniform) steps,
-        # not a flat per-sample mean which would over-weight whatever phase
-        # of the transient the adaptive solver happened to sample densely.
+
         if t is not None and len(t) > 1:
             Qdot_th = float(_trapz(Qdot_th_trace, t) / (t[-1] - t[0]))
         else:
             Qdot_th = float(np.mean(Qdot_th_trace))
 
-        # ── Modulation floor (datasheet: ALM 4-12 min stable output ~4 kW) ────
-        # The inverter compressor cannot sustain output between 0 and 4 kW.
-        # It either runs at >= 4 kW or shuts off entirely.
+
         Q_MOD_MIN = 4000.0   # W — minimum stable thermal output
         if Qdot_th >= Q_MOD_MIN / 2.0:
             Qdot_th = max(Qdot_th, Q_MOD_MIN)   # run at least at the floor

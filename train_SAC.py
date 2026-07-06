@@ -65,12 +65,14 @@ def get_args():
                         'profiles folder available.')
 
     # Environment
-    p.add_argument('--days',           type=int,   default=30)
+    p.add_argument('--days',           type=int,   default=212,
+                   help='Episode length in days. Default 212 = one full Oct–Apr '
+                        'heating period (matches train_heating.csv period length).')
     p.add_argument('--comfort_weight', type=float, default=50.0,
                    help='Tier 1: weight on comfort penalty.')
     p.add_argument('--price_weight',   type=float, default=20.0,
                    help='Tier 2: weight on electricity cost penalty.')
-    p.add_argument('--cycle_weight',   type=float, default=25.0,
+    p.add_argument('--cycle_weight',   type=float, default=50.0,
                    help='Tier 3: weight on compressor start-cycling penalty.')
     p.add_argument('--forecast_steps', type=int,   default=24)
 
@@ -79,13 +81,17 @@ def get_args():
     p.add_argument('--run_name',        type=str, default='sac_hp')
     p.add_argument('--seed',            type=int, default=42)
     p.add_argument('--n_eval_episodes', type=int, default=5)
+    p.add_argument('--eval_freq',       type=int, default=10_000,
+                   help='Evaluate every n env steps. Default 10,000 aligns '
+                        'with ~2 episodes at 212-day episode length and avoids '
+                        'evaluating during the learning_starts random phase.')
 
     # SAC hyperparameters
     p.add_argument('--lr',              type=float, default=1e-4)
     p.add_argument('--gamma',           type=float, default=0.99)
-    p.add_argument('--buffer_size',     type=int,   default=100_000,
+    p.add_argument('--buffer_size',     type=int,   default=300_000,
                    help='Replay buffer size.')
-    p.add_argument('--learning_starts', type=int,   default=5_000,
+    p.add_argument('--learning_starts', type=int,   default=10_000,
                    help='Steps of random exploration before training starts.')
     p.add_argument('--batch_size',      type=int,   default=256)
     p.add_argument('--tau',             type=float, default=0.005,
@@ -187,14 +193,12 @@ def main():
     eval_env.seed(args.seed)
 
     # ── Callbacks ─────────────────────────────────────────────────────────────
-    eval_freq = 5_000
-
     callbacks = [
         EvalCallback(
             eval_env,
             best_model_save_path=run_dir,
             log_path=log_dir,
-            eval_freq=eval_freq,
+            eval_freq=args.eval_freq,
             n_eval_episodes=args.n_eval_episodes,
             deterministic=True,
             verbose=1,
@@ -229,7 +233,7 @@ def main():
     print(f"  Episode        : {args.days} days")
     print(f"  Reward weights : comfort={args.comfort_weight}  price={args.price_weight}  cycle={args.cycle_weight}")
     print(f"  Buffer size    : {args.buffer_size:,}  |  Learning starts: {args.learning_starts:,}")
-    print(f"  Eval every     : {eval_freq:,} steps  ({args.n_eval_episodes} episodes)")
+    print(f"  Eval every     : {args.eval_freq:,} steps  ({args.n_eval_episodes} episodes)")
     print(f"  Run dir        : {run_dir}")
     print(f"  TensorBoard    : tensorboard --logdir {log_dir}\n")
 

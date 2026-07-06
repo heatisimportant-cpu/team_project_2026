@@ -1,55 +1,8 @@
-# -*- coding: utf-8 -*-
-"""
-Gains
-=====
-Builds the combined solar + internal heat gain disturbance series
-(`Qdot_gains` [W]) for the building, aligned to a given timestamp index.
-
-Two independent sources are combined:
-
-  Solar gains
-  -----------
-  From a fixed, pre-cleaned CSV (see solar_gains_MFH_Vonovia_Ref_fixed.csv)
-  with hourly Q_sol_W already transposed onto the building's real window
-  geometry (see vonovia_model.py windows/g-value derivation notes). That
-  file's timestamps are UTC; this module converts them to the target
-  index's local time (DST-aware) before aligning, since the building's
-  own weather/price data (e.g. train_2021_2023.csv) is in local time
-  (confirmed by its DST gap pattern -- a missing 02:00 on the last
-  Sunday of March, the standard Europe/Berlin "spring forward" signature).
-
-  Internal gains
-  --------------
-  From an hourly occupancy/appliance profile (specific gains in W/m^2,
-  separate workday vs weekend multipliers per hour), scaled by the
-  building's floor area. Workday/weekend is derived from each target
-  timestamp's actual day of week, not assumed.
-
-Both are recomputed fresh from source each run (not cached to a merged
-CSV), per project decision -- so changes to either source file, the
-floor area, or the target index are always reflected without a stale
-intermediate file to keep in sync.
-
-IMPORTANT: Qdot_gains is a hidden simulation input only. It is NOT
-added to the RL observation (see room_env.py) -- the agent cannot
-observe or forecast solar/internal gains directly, by design, since
-neither can be reliably predicted in real-time deployment. Instead the
-agent is given cyclical time features (hour-of-day, day-of-year,
-is_weekend) so it can learn the *statistical pattern* of when gains
-tend to be high or low, without depending on knowing their exact value.
-"""
-
 import glob
 import os
 import numpy as np
 import pandas as pd
 
-# Fixed location for gain profile data, matching the project's data/profiles/
-# folder convention. solar_*.csv files in here (e.g. solar_2021_2023.csv,
-# solar_2024_onwards.csv) are auto-discovered and stitched together -- the
-# caller doesn't need to know or specify which period file covers which
-# date range; whatever combination of files is needed gets picked up
-# automatically by reindexing against the target index later.
 DEFAULT_PROFILES_DIR = 'data/profiles'
 DEFAULT_INTERNAL_GAINS_FILENAME = 'internal_gains.csv'
 
@@ -103,9 +56,6 @@ def load_solar_gains(path: str, target_tz: str = 'Europe/Berlin') -> pd.Series:
     df = pd.read_csv(path, parse_dates=['timestamp'])
     idx = pd.DatetimeIndex(df['timestamp']).tz_localize('UTC').tz_convert(target_tz)
     s = pd.Series(df['Q_sol_W'].values, index=idx, name='Q_sol_W')
-    # DST fall-back creates a duplicate local hour; spring-forward creates a
-    # gap. Drop duplicates (keep first) so reindex/interpolation downstream
-    # behaves predictably; the gap is handled naturally by reindex+interpolate.
     s = s[~s.index.duplicated(keep='first')]
     return s.sort_index()
 
@@ -160,35 +110,7 @@ def build_gains_series(index: pd.DatetimeIndex,
                         target_tz: str = 'Europe/Berlin',
                         solar_csv_path: str = None,
                         internal_csv_path: str = None) -> pd.Series:
-    """Combined solar + internal Qdot_gains [W], aligned exactly to `index`.
 
-    By default, solar data is auto-discovered from every solar_*.csv file
-    in `profiles_dir` (stitched together -- see load_all_solar_gains), and
-    internal gains from `profiles_dir`/internal_gains.csv. No explicit
-    file paths are needed for the normal case of a fixed data/profiles/
-    folder; pass solar_csv_path/internal_csv_path to override for one-off
-    use (e.g. testing against a file outside the usual folder).
-
-    Parameters
-    ----------
-    index : pd.DatetimeIndex
-        The target disturbance series' index (e.g. T_amb/price data's
-        index) that Qdot_gains must align to.
-    profiles_dir : str
-        Folder containing solar_*.csv file(s) and internal_gains.csv.
-    area_floor : float
-        Building floor area [m^2]. Required.
-    target_tz : str
-        Timezone `index` is in (for converting the UTC solar files).
-    solar_csv_path, internal_csv_path : str, optional
-        Override the auto-discovered paths with a specific single file.
-
-    Returns
-    -------
-    pd.Series
-        Qdot_gains [W], indexed exactly as `index` (same length, same
-        timestamps), ready to assign as a 'Qdot_gains' column.
-    """
     if area_floor is None:
         raise ValueError("area_floor is required (e.g. vonovia_model['area_floor']).")
 
@@ -200,25 +122,7 @@ def build_gains_series(index: pd.DatetimeIndex,
     if internal_csv_path is None:
         internal_csv_path = os.path.join(profiles_dir, DEFAULT_INTERNAL_GAINS_FILENAME)
 
-    # `index` (e.g. from train_2021_2023.csv) is naive local civil time --
-    # confirmed by its DST gap pattern (missing 02:00 on spring-forward
-    # Sundays) -- while solar_raw is tz-aware after UTC->target_tz
-    # conversion. Reindexing a naive index against a tz-aware series
-    # matches NOTHING (different dtypes), which silently zeroed out solar
-    # gains entirely in initial testing. Fix: localize a COPY of the
-    # index for matching purposes only, then return values on the
-    # ORIGINAL (naive) index so the result drops straight into the
-    # caller's existing naive-indexed DataFrame.
     if index.tz is None:
-        # nonexistent='shift_forward': spring-forward gap hours don't exist
-        # in local time anyway (confirmed absent from the real data), so
-        # this only matters if some other naive index ever includes one.
-        # ambiguous=False: fall-back's repeated local hour (e.g. 31 Oct
-        # 02:00) is treated as the post-transition (standard time)
-        # occurrence -- a deterministic convention, since the real data
-        # has no duplicate entry to infer the correct side from, and the
-        # 1-hour uncertainty this introduces is negligible (1 hour out of
-        # tens of thousands in the series).
         match_index = index.tz_localize(
             target_tz, nonexistent='shift_forward', ambiguous=False)
     else:

@@ -207,10 +207,42 @@ class Building:
 #
 vonovia_model = {
     # Thermal properties
-    'H_ve':         62.0,     # Ventilation losses [W/K]
-    'H_tr_heavy':  245.0,     # Opaque envelope (walls/roof/floor) [W/K] -- thermal-mass coupled
-    'H_tr_light':   36.0,     # Window transmission [W/K] -- fast/massless path
-    'c_bldg':       35.0,     # Thermal mass [Wh/m²K]
+    # Derived from LAN_Vir_6_1 Planunterlagen 31.03.2025 (source of truth):
+    #
+    #   Step 1 — H_ve:
+    #     Building volume V = 287.92 × 2.5 = 719.8 m³
+    #     TABULA 1958-68 archetype ventilation rate: n = 0.51 ACH
+    #     H_ve = 0.34 [Wh/m³K] × 0.51 [1/h] × 719.8 [m³] = 124.8 W/K
+    #     (old value of 62 W/K used 0.34×n×V formula but with a much too
+    #      low n=0.25 ACH — not from any TABULA source)
+    #
+    #   Step 2 — H_tr_light:
+    #     U_window = 0.70 W/(m²K) from building docs (refurbished glazing)
+    #     Total window area = 51 m² (from Planunterlagen, all four facades)
+    #     H_tr_light = 0.70 × 51 = 35.7 W/K  (unchanged from correct value)
+    #
+    #   Step 3 — H_tr_heavy (back-solved from design load):
+    #     Q_design  = 10,968 W from Planunterlagen (HP sizing sheet)
+    #     T_amb_des = -12°C (Hannover EN 12831 norm), T_room = 21°C → dT = 33 K
+    #     UA_required = 10968 / 33 = 332.4 W/K
+    #     H_tr_heavy  = 332.4 - 124.8 - 35.7 = 171.9 W/K
+    #     → implied U_opaque = 171.9 / 634.7 m² opaque area = 0.27 W/(m²K)
+    #       (plausible: partially refurbished 1968 masonry, between EnEV 0.24
+    #        and original uninsulated stock ~0.8-1.0 W/m²K)
+    #
+    #   Step 4 — c_bldg:
+    #     All four TABULA archetypes (1919-48, 1949-57, 1958-68, 1969-78)
+    #     use c_bldg = 45 Wh/(m²K) without exception. Old value of 35
+    #     had no TABULA basis and gave a thermal time constant of only ~21h
+    #     vs. the TABULA-consistent 38h for this building.
+    #     (Heavy MFH masonry τ typically 30-60h; 38h is physically reasonable.)
+    #
+    'H_ve':         124.8,    # Ventilation losses [W/K]  — 0.34×0.51ACH×719.8m³
+    'H_tr_heavy':   171.9,    # Opaque envelope [W/K]     — back-solved from Q_design
+    'H_tr_light':    35.7,    # Window transmission [W/K] — 0.70 W/m²K × 51 m²
+    'c_bldg':        45.0,    # Thermal mass [Wh/m²K]     — TABULA (all archetypes)
+    # Cross-check: UA = 124.8+171.9+35.7 = 332.4 W/K
+    #              Q_design = 332.4 × 33K = 10,969 W ✓ matches 10,968 W from doc
 
     # Geometry
     'area_floor':  287.92,    # Floor area [m²]
@@ -218,13 +250,18 @@ vonovia_model = {
 
     # Heat pump
     'T_offset':     -2.0,     # Temperature offset [K]
-    'T_amb_lim':   15.0,     # Outdoor temp above which heating stops [°C]
+    'T_amb_lim':    15.0,     # Outdoor temp above which heating stops [°C] --
+                              # site doc: "Die Heizgrenztemperatur ist dabei immer 15°C"
     'mdot_hp':       0.27,    # HP mass flow rate [kg/s]
 
-    # Windows [m²]
+    # Windows [m²] — from Planunterlagen facade measurements
     'windows': {'east': 12.0, 'south': 18.0, 'west': 12.0, 'north': 9.0},
     'tilt':           90.0,
     'frame_fraction':  0.3,
+    'g_value':         0.50,  # TABULA 1_enev→2_kfw; matches U=0.70 glazing tier
+    'c_shade':         0.70,  # → g_eff = 0.35, matches recomputed solar gains CSV
+                              # (g_value/c_shade are informational only — solar gains
+                              #  come from precomputed CSV, not live in the ODE)
 
     # Location
     'latitude':   52.44,
@@ -233,5 +270,5 @@ vonovia_model = {
     'timezone':   'Europe/Berlin',
 
     # Name
-    'name': 'vonovia_model',
+    'name': 'vonovia_virchowstr6',
 }

@@ -4,7 +4,7 @@ Room Heating Gymnasium Environment
 ====================================
 Wraps the Simulator into a Gymnasium-compatible RL environment.
 
-Observation (65 dims)
+Observation (66 dims)
 ---------------------
   [0:3]   Building states   : T_room, T_wall, T_hp_ret
   [3]     T_amb             : current outdoor temperature  [°C]
@@ -18,6 +18,15 @@ Observation (65 dims)
   [57]    is_weekend        : 1.0 Sat/Sun, 0.0 Mon-Fri
   [58]    Q_sol_W(t)        : current solar gain through windows [W]
   [59:65] Q_sol_W(t+1…t+6) : 6-hour solar gain forecast [W]
+  [65]    hp_was_on         : 1.0 if HP was on last step, 0.0 otherwise
+
+  hp_was_on gives the agent explicit knowledge of the compressor's
+  previous state without needing to infer it from T_hp_ret dynamics.
+  This helps it learn smoother control (e.g. avoid immediately restarting
+  the HP after it just turned off) without relying solely on the cycle
+  penalty in the reward. The feature is the same as self._hp_was_on
+  which is already tracked for cycle detection -- it costs nothing to
+  expose it.
 
   Solar gains (Q_sol_W) are exposed because cloud cover varies day to
   day within a season -- the time features give the agent the average
@@ -26,10 +35,11 @@ Observation (65 dims)
   reduce heating before a solar peak arrives, which is the primary
   cause of heating-period overheating (room hitting 30°C+ on sunny
   March/October days when the HP was still running in the morning).
-  Internal gains are NOT exposed separately -- they are almost
-  deterministic given hour-of-day + is_weekend, which are already
-  in the observation.
-  Normalization bounds for Q_sol_W: [0, 15000] W → [-1, 1].
+  Normalization bounds for Q_sol_W: [0, 8000] W → [-1, 1].
+  (Bound lowered from 15,000 W to 8,000 W to match real DWD-measured
+   solar data: max Q_sol_W in Braunschweig station 2021-2026 = 5,947 W;
+   8,000 W gives physical headroom while using ~75% of the [-1,1] range
+   vs only ~40% at the old 15,000 W ceiling.)
 
 Action (1 dim)
 --------------
@@ -132,7 +142,13 @@ class RoomHeatEnv(gym.Env):
             if 'Q_sol_W' in disturbances.columns
             else 0.0
         )
-        self.p = self.p.resample(f'{delta_t}s').ffill().astype(np.float32)
+        # No resample here: env accesses rows by integer position (iloc),
+        # not by timestamp, so gaps between concatenated heating periods
+        # are handled correctly -- rows simply follow each other in order.
+        # Resampling non-contiguous periods (e.g. Oct-Apr, Oct-Apr) with
+        # ffill would fill the summer gap with stale April values, creating
+        # months of garbage data in self.p.
+        self.p = self.p.astype(np.float32)
 
         # ── Models & simulator ────────────────────────────────────────────────
         self.bldg_model = Building(
@@ -266,6 +282,7 @@ class RoomHeatEnv(gym.Env):
             'T_amb':       float(pk['T_amb']),
             'u':           float(T_hp_sup),
             'hp_on':       bool(hp_is_on),
+            'hp_was_on':   bool(self._hp_was_on),   # state AFTER update — hp_on from this step
             'cycle_start': bool(cycle_start),
             't':           int(self.t),
         }
@@ -302,12 +319,16 @@ class RoomHeatEnv(gym.Env):
         # is a 0/1 flag, scaled to [-1,1] like everything else for consistency.
         low  += [-1.0, -1.0, -1.0, -1.0, 0.0]
         high += [ 1.0,  1.0,  1.0,  1.0, 1.0]
-        # Solar gain: current + 6-hour forecast, bounded [0, 15000] W.
-        # Max observed in real data: ~12,525 W; 15,000 W gives physical
-        # headroom without distorting the normalized scale for typical values.
-        Q_SOL_MAX = 15_000.0
+        # Solar gain: current + 6-hour forecast, bounded [0, 8000] W.
+        # Lowered from 15,000 W: real DWD-measured data (Braunschweig station
+        # 2021-2026) peaks at 5,947 W; 8,000 W gives physical headroom while
+        # using ~75% of the [-1,1] range (vs only ~40% at 15,000 W).
+        Q_SOL_MAX = 8_000.0
         low  += [0.0]       * 7   # current + 6 forecast steps
         high += [Q_SOL_MAX] * 7
+        # HP on/off state from the previous step — binary 0/1 flag.
+        low  += [0.0]
+        high += [1.0]
         return (np.array(low, dtype=np.float32), np.array(high, dtype=np.float32))
 
     def _normalize(self, raw_obs: np.ndarray) -> np.ndarray:
@@ -341,10 +362,17 @@ class RoomHeatEnv(gym.Env):
         obs.append(1.0 if ts.dayofweek >= 5 else 0.0)   # Sat=5, Sun=6
 
         # Solar gain: current value + 6-hour ahead forecast.
-        # Clipped to [0, 15000] before normalization handles any rare spikes.
+        # Clipped to [0, 8000] before normalization handles any rare spikes.
         for i in range(7):   # i=0: current, i=1..6: forecast
             q = float(self.p.iloc[min(self.t + i, len(self.p) - 1)]['Q_sol_W'])
             obs.append(max(0.0, q))
+
+        # HP on/off state from the PREVIOUS step (self._hp_was_on is already
+        # tracked for cycle detection -- free to expose in obs at no extra cost).
+        # Gives the agent explicit knowledge of whether it just started/stopped
+        # the compressor, helping it learn smoother control without needing to
+        # infer HP state from T_hp_ret dynamics alone.
+        obs.append(1.0 if self._hp_was_on else 0.0)
 
         return np.array(obs, dtype=np.float32)
 
