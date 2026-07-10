@@ -1,7 +1,8 @@
 import numpy as np
 from scipy.integrate import solve_ivp
 
-_trapz = getattr(np, 'trapezoid', None) 
+# numpy >=2.0 renamed trapz -> trapezoid; keep working on both
+_trapz = getattr(np, 'trapezoid', None) or np.trapz
 
 
 class Simulator:
@@ -58,7 +59,15 @@ class Simulator:
             T_amb=pk['T_amb'], T_flow=uk) * 1000.0
 
         # Build input list: T_hp_sup first, then disturbances
-        input_dict   = {'T_hp_sup': uk, 'Qdot_hp_max': Qdot_hp_max_W, **pk}
+        # Backup heater (Heizstab 6kW): fires automatically when HP is on
+        # AND room is below the comfort lower bound (20°C). Rule-based,
+        # not agent-controlled — matches real iDM controller behaviour.
+        T_room_prev  = x_init['T_room']
+        hp_is_on     = uk > 21.0   # HP running when supply setpoint above return+margin
+        Q_backup_max = self.bldg_model.params.get('Q_backup_max', 0.0)
+        Q_backup     = Q_backup_max if (hp_is_on and T_room_prev < 20.0) else 0.0
+        input_dict   = {'T_hp_sup': uk, 'Qdot_hp_max': Qdot_hp_max_W,
+                        'Q_backup': Q_backup, **pk}
         input_values = [input_dict[key] for key in input_keys]
 
         # Integrate ODE over one timestep
@@ -120,9 +129,9 @@ class Simulator:
 
         T_hp_sup    = input_dict['T_hp_sup']
         T_amb       = input_dict['T_amb']
-        Qdot_hp_max = input_dict['Qdot_hp_max']   # W, real compressor ceiling
+        Qdot_hp_max = input_dict['Qdot_hp_max']
+        Q_backup    = input_dict.get('Q_backup', 0.0)
 
-        # ── HP energy cost ────────────────────────────────────────────────────
         COP = self.hp_model.compute_COP(T_amb=T_amb, T_flow=T_hp_sup)
 
         Qdot_th_trace = np.clip(
@@ -130,30 +139,37 @@ class Simulator:
             0.0, Qdot_hp_max,
         )
 
-
         if t is not None and len(t) > 1:
             Qdot_th = float(_trapz(Qdot_th_trace, t) / (t[-1] - t[0]))
         else:
             Qdot_th = float(np.mean(Qdot_th_trace))
 
-
-        Q_MOD_MIN = 4000.0   # W — minimum stable thermal output
+        # ── Modulation floor ──────────────────────────────────────────────────
+        Q_MOD_MIN = 4000.0
         if Qdot_th >= Q_MOD_MIN / 2.0:
-            Qdot_th = max(Qdot_th, Q_MOD_MIN)   # run at least at the floor
+            Qdot_th = max(Qdot_th, Q_MOD_MIN)
             hp_on   = True
         else:
-            Qdot_th = 0.0                         # below half-floor -> off
+            Qdot_th = 0.0
             hp_on   = False
 
-        P_el = Qdot_th / COP if (COP > 0 and hp_on) else 0.0   # W
-        E_el = P_el * self.timestep / 3600.0                    # Wh
+        P_el_hp      = Qdot_th / COP if (COP > 0 and hp_on) else 0.0   # W
+        # Backup heater is pure resistance: COP=1, P_el = Q_thermal
+        # Only runs when HP is on (hp_on already accounts for modulation floor)
+        P_el_backup  = Q_backup if hp_on else 0.0                       # W
+        P_el         = P_el_hp + P_el_backup                            # W total
+        E_el         = P_el * self.timestep / 3600.0                    # Wh
 
         cost_hp = {
-            'COP':     float(COP),
-            'Qdot_th': float(Qdot_th),   # W
-            'P_el':    float(P_el),       # W
-            'E_el':    float(E_el),       # Wh
-            'hp_on':   bool(hp_on),       # True if compressor is running
+            'COP':          float(COP),
+            'Qdot_th':      float(Qdot_th),       # W  HP thermal only
+            'Q_backup':     float(P_el_backup),    # W  backup thermal (=P_el_backup, COP=1)
+            'P_el':         float(P_el),           # W  total electrical
+            'P_el_hp':      float(P_el_hp),        # W  HP compressor only
+            'P_el_backup':  float(P_el_backup),    # W  backup heater only
+            'E_el':         float(E_el),           # Wh total
+            'hp_on':        bool(hp_on),
+            'backup_on':    bool(P_el_backup > 0),
         }
 
         # ── Comfort deviation ─────────────────────────────────────────────────

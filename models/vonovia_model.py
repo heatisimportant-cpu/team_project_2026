@@ -41,7 +41,7 @@ class Building:
         self.method = '4R3C'
 
         self.state_keys = ('T_room', 'T_wall', 'T_hp_ret')
-        self.input_keys  = ('T_hp_sup', 'T_amb', 'Qdot_gains', 'Qdot_hp_max')
+        self.input_keys  = ('T_hp_sup', 'T_amb', 'Qdot_gains', 'Qdot_hp_max', 'Q_backup')
 
         self._calc_bldg_parameters()
 
@@ -90,31 +90,28 @@ class Building:
         T_hp_sup    = args[0]
         T_amb       = args[1]
         Qdot_gains  = args[2]
-        Qdot_hp_max = args[3]   # W -- real compressor capacity ceiling at this (T_amb, T_hp_sup)
+        Qdot_hp_max = args[3]
+        Q_backup    = args[4]   # [W] electric backup heater (Heizstab), COP=1
 
         rhs = np.zeros(3)
 
-        # The compressor cannot deliver more heat than its real datasheet
-        # capacity allows, even if (T_hp_sup - T_hp_ret) implies more.
-        # Without this cap, the ODE models an idealized infinite-capacity
-        # heat source and the agent could "request" physically impossible
-        # heating rates (e.g. high T_hp_sup at very cold T_amb).
         Qdot_hp_requested = self.mdot_hp * C_WATER_SPEC * (T_hp_sup - T_hp_ret)
         Qdot_hp = np.clip(Qdot_hp_requested, 0.0, Qdot_hp_max)
 
         rhs[0] = (1 / self.params['C_zone'] *
                   (Qdot_gains
-                   + self.params['H_rad_con']  * (T_hp_ret - T_room)
+                   + self.params['H_rad_con']      * (T_hp_ret - T_room)
                    - 2 * self.params['H_tr_heavy'] * (T_room - T_wall)
-                   - self.params['H_tr_light']      * (T_room - T_amb)   # windows: fast path, no thermal mass
+                   - self.params['H_tr_light']      * (T_room - T_amb)
                    - self.params['H_ve']            * (T_room - T_amb)))
 
         rhs[1] = (1 / self.params['C_wall'] *
                   (2 * self.params['H_tr_heavy'] * (T_room - T_wall)
                    - 2 * self.params['H_tr_heavy'] * (T_wall - T_amb)))
 
+        # Heizstab adds heat directly into the hydraulic circuit alongside the HP
         rhs[2] = (1 / self.params['C_water'] *
-                  (Qdot_hp
+                  (Qdot_hp + Q_backup
                    - self.params['H_rad_con'] * (T_hp_ret - T_room)))
 
         return rhs
@@ -253,6 +250,9 @@ vonovia_model = {
     'T_amb_lim':    15.0,     # Outdoor temp above which heating stops [°C] --
                               # site doc: "Die Heizgrenztemperatur ist dabei immer 15°C"
     'mdot_hp':       0.27,    # HP mass flow rate [kg/s]
+    'Q_backup_max': 6000.0,   # [W] Electric backup heater (Heizstab) — from Planunterlagen
+                              # Integrated 6 kW immersion heater in hydraulic module.
+                              # Activates automatically when HP is on and T_room < 20°C.
 
     # Windows [m²] — from Planunterlagen facade measurements
     'windows': {'east': 12.0, 'south': 18.0, 'west': 12.0, 'north': 9.0},

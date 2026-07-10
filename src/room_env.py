@@ -142,12 +142,6 @@ class RoomHeatEnv(gym.Env):
             if 'Q_sol_W' in disturbances.columns
             else 0.0
         )
-        # No resample here: env accesses rows by integer position (iloc),
-        # not by timestamp, so gaps between concatenated heating periods
-        # are handled correctly -- rows simply follow each other in order.
-        # Resampling non-contiguous periods (e.g. Oct-Apr, Oct-Apr) with
-        # ffill would fill the summer gap with stale April values, creating
-        # months of garbage data in self.p.
         self.p = self.p.astype(np.float32)
 
         # ── Models & simulator ────────────────────────────────────────────────
@@ -282,7 +276,7 @@ class RoomHeatEnv(gym.Env):
             'T_amb':       float(pk['T_amb']),
             'u':           float(T_hp_sup),
             'hp_on':       bool(hp_is_on),
-            'hp_was_on':   bool(self._hp_was_on),   # state AFTER update — hp_on from this step
+            'backup_on':   bool(costs.get('backup_on', False)),
             'cycle_start': bool(cycle_start),
             't':           int(self.t),
         }

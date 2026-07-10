@@ -116,79 +116,60 @@ def run_episode(model, env):
 # ── Plot ──────────────────────────────────────────────────────────────────────
 
 def plot_results(df, T_low, T_high, save_path=None):
-    fig, axes = plt.subplots(3, 1, figsize=(14, 10), sharex=True)
-    fig.patch.set_facecolor('#0f1117')
+    # ── Light theme colours ───────────────────────────────────────────────────
+    BG        = '#FAFAF7'    # warm off-white matching beige presentation
+    AX_BG     = '#FFFFFF'
+    GRID      = '#D8D4CC'
+    TEXT      = '#1A1A1A'
+    SUBTEXT   = '#444444'
+    COMFORT   = '#1B8C2E'    # vivid green comfort band
+    T_ROOM    = '#0057D9'    # strong blue room temperature
+    UNDER     = '#D62728'    # strong red underheating
+    OVER      = '#FF6B00'    # vivid orange overheating
+    T_AMB     = '#7B2FBE'    # vivid purple ambient
+
+    fig, axes = plt.subplots(2, 1, figsize=(14, 8), sharex=True)
+    fig.patch.set_facecolor(BG)
     for ax in axes:
-        ax.set_facecolor('#161b22')
-        ax.tick_params(colors='#8b949e')
-        ax.spines[:].set_color('#30363d')
-        ax.yaxis.label.set_color('#e6edf3')
-        ax.xaxis.label.set_color('#8b949e')
+        ax.set_facecolor(AX_BG)
+        ax.tick_params(colors=TEXT, labelsize=10)
+        ax.spines[:].set_color(GRID)
+        ax.yaxis.label.set_color(TEXT)
+        ax.xaxis.label.set_color(SUBTEXT)
 
     t = df.index
 
     # ── Panel 1: Room temperature + comfort band ──────────────────────────────
     ax1 = axes[0]
-    ax1.fill_between(t, T_low, T_high, alpha=0.15, color='#3fb950',
+    ax1.fill_between(t, T_low, T_high, alpha=0.25, color=COMFORT,
                      label=f'Comfort band [{T_low}–{T_high}°C]')
-    ax1.axhline(T_low,  color='#3fb950', linewidth=0.8, linestyle='--', alpha=0.6)
-    ax1.axhline(T_high, color='#3fb950', linewidth=0.8, linestyle='--', alpha=0.6)
-    ax1.plot(t, df['T_room'], color='#58a6ff', linewidth=1.5, label='T_room')
-    ax1.set_ylabel('Temperature [°C]')
-    ax1.set_title('Room Temperature vs Comfort Band', color='#e6edf3',
-                  fontsize=11, pad=8)
-    ax1.legend(loc='upper right', framealpha=0.3,
-               labelcolor='#e6edf3', facecolor='#161b22', edgecolor='#30363d')
-    ax1.grid(axis='y', color='#30363d', linewidth=0.5)
+    ax1.axhline(T_low,  color=COMFORT, linewidth=1.8, linestyle='--', alpha=1.0)
+    ax1.axhline(T_high, color=COMFORT, linewidth=1.8, linestyle='--', alpha=1.0)
+    ax1.plot(t, df['T_room'], color=T_ROOM, linewidth=1.2, label='Room temperature')
 
-    # Shade comfort violations (both under- and over-heating)
-    viol_low  = df['T_room'] < T_low
-    viol_high = df['T_room'] > T_high
-    if viol_low.any():
-        ax1.fill_between(t, df['T_room'], T_low,
-                         where=viol_low, alpha=0.3, color='#f85149',
-                         label='Under-heating')
-    if viol_high.any():
-        ax1.fill_between(t, df['T_room'], T_high,
-                         where=viol_high, alpha=0.3, color='#d29922',
-                         label='Over-heating')
 
-    # ── Panel 2: Supply temperature + electrical power ────────────────────────
+    ax1.set_ylabel('Room Temperature [°C]', color=TEXT, fontsize=11)
+    ax1.set_title('Room Temperature vs Comfort Band', color=TEXT, fontsize=12, pad=8)
+    ax1.legend(loc='upper right', framealpha=0.8, labelcolor=TEXT,
+               facecolor=AX_BG, edgecolor=GRID, fontsize=9)
+    ax1.grid(axis='y', color=GRID, linewidth=0.6)
+
+    # ── Panel 2: Ambient temperature ─────────────────────────────────────────
     ax2 = axes[1]
-    l1, = ax2.plot(t, df['u'], color='#ff7b72', linewidth=1.5, label='T_hp_sup (applied)')
-    ax2.set_ylabel('Supply Temp [°C]', color='#ff7b72')
-    ax2.tick_params(axis='y', colors='#ff7b72')
-    ax2.set_title('HP Supply Temperature & Electrical Power', color='#e6edf3',
-                  fontsize=11, pad=8)
-    ax2.grid(axis='y', color='#30363d', linewidth=0.5)
+    ax2.plot(t, df['T_amb'], color=T_AMB, linewidth=1.2, label='Outdoor temperature')
+    ax2.axhline(0, color=SUBTEXT, linewidth=0.7, linestyle=':', alpha=0.6)
+    ax2.axhline(vonovia_model['T_amb_lim'], color=COMFORT, linewidth=1.8,
+                linestyle='--', alpha=1.0,
+                label=f"Heating limit ({vonovia_model['T_amb_lim']}°C)")
+    ax2.set_ylabel('Outdoor Temperature [°C]', color=TEXT, fontsize=11)
+    ax2.set_xlabel('Date', color=SUBTEXT, fontsize=10)
+    ax2.set_title('Outdoor Ambient Temperature', color=TEXT, fontsize=12, pad=8)
+    ax2.legend(loc='upper right', framealpha=0.8, labelcolor=TEXT,
+               facecolor=AX_BG, edgecolor=GRID, fontsize=9)
+    ax2.grid(axis='y', color=GRID, linewidth=0.6)
+    ax2.xaxis.set_major_formatter(DateFormatter('%d %b'))
 
-    ax2b = ax2.twinx()
-    ax2b.set_facecolor('#161b22')
-    ax2b.tick_params(colors='#8b949e')
-    ax2b.spines[:].set_color('#30363d')
-    l2, = ax2b.plot(t, df['P_el_kW'], color='#79c0ff', linewidth=1.3,
-                     alpha=0.9, label='P_el (electrical power)')
-    ax2b.fill_between(t, 0, df['P_el_kW'], color='#79c0ff', alpha=0.10)
-    ax2b.set_ylabel('Electrical Power [kW]', color='#79c0ff')
-    ax2b.tick_params(axis='y', colors='#79c0ff')
-    ax2b.set_ylim(bottom=0)
-
-    ax2.legend(handles=[l1, l2], loc='upper right', framealpha=0.3,
-               labelcolor='#e6edf3', facecolor='#161b22', edgecolor='#30363d')
-
-    # ── Panel 3: Ambient temperature ──────────────────────────────────────────
-    ax3 = axes[2]
-    ax3.plot(t, df['T_amb'], color='#d2a8ff', linewidth=1.5, label='T_amb')
-    ax3.axhline(0, color='#8b949e', linewidth=0.6, linestyle=':')
-    ax3.set_ylabel('Ambient Temp [°C]')
-    ax3.set_xlabel('Time')
-    ax3.set_title('Outdoor Ambient Temperature', color='#e6edf3', fontsize=11, pad=8)
-    ax3.legend(loc='upper right', framealpha=0.3,
-               labelcolor='#e6edf3', facecolor='#161b22', edgecolor='#30363d')
-    ax3.grid(axis='y', color='#30363d', linewidth=0.5)
-    ax3.xaxis.set_major_formatter(DateFormatter('%d %b'))
-
-    # ── Summary stats ─────────────────────────────────────────────────────────
+    # ── Summary stats text ────────────────────────────────────────────────────
     total_cost         = (df['price'] * df['E_el_kWh']).sum()
     total_energy       = df['E_el_kWh'].sum()
     total_thermal_kWh  = df['Qdot_th_kW'].sum()
@@ -221,9 +202,7 @@ def plot_results(df, T_low, T_high, save_path=None):
              f"HP+gains: {total_combined_kWh:.0f} kWh over {n_days:.0f} days  |  "
              f"Comfort: {pct_comfort:.1f}% (under: {pct_under:.1f}%, over: {pct_over:.1f}%)  |  "
              f"HP cycles: {n_cycles}")
-    fig.text(0.5, 0.01, stats, ha='center', color='#8b949e', fontsize=9)
-
-    plt.tight_layout(rect=[0, 0.03, 1, 1])
+    plt.tight_layout(rect=[0, 0.01, 1, 1])
     plt.subplots_adjust(hspace=0.35)
 
     if save_path:
